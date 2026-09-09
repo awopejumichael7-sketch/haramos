@@ -718,9 +718,11 @@ function baseProduct(p){
 }
 // unitConversions: list of {unit, factor} where factor = how many `stockUnit`s one of `unit` equals
 // e.g. stockUnit "Bag", {unit:"Cup", factor:1/320} means 1 Cup = 1/320 of a Bag
-const SEED_PRODUCTS = [
-  baseProduct({ name:"2mm Giwa Aqua 15kg", category:"Giwa Feed", stockUnit:"Bag", currentStock:0, sellingPrice:27500, needsPricing:false })
-  ];
+// Demo/starter product intentionally removed — the catalogue should only
+// ever contain products the Admin adds from the Products page. Leave this
+// array empty; seedIfEmpty() below still runs (for the settings/app_flags
+// bookkeeping and store_info defaults) but will have nothing to seed.
+const SEED_PRODUCTS = [];
 
 /* ------------------------------------------------------------------
    6. APP STATE
