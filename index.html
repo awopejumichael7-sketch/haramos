@@ -2357,34 +2357,59 @@ async function syncAdvanceDebt(adv){
 window.openManualAdvanceModal = function(){
   openModal(`<div class="modal-head"><h3>Add Advance Payment</h3><button class="close-x" onclick="window.__closeModal()">✕</button></div>
   <div class="modal-body">
-    <p style="font-size:12.5px;color:var(--ink-soft)">Record a deposit a customer paid ahead of collecting reserved goods. You can enter more than the goods' value — the extra is saved as store credit on this record.</p>
+    <p style="font-size:12.5px;color:var(--ink-soft)">Record a deposit a customer paid ahead of collecting reserved goods. The total is calculated automatically from each product's exact price. You can enter more than that total — the extra is saved as store credit on this record.</p>
     <div class="field"><label>Customer</label><input id="maCust" list="maCustList" placeholder="Search or type a new customer name">
       <datalist id="maCustList">${state.customers.map(c=>`<option value="${escapeHtml(c.name)}">`).join("")}</datalist></div>
     <div class="form-grid">
       <div class="field"><label>Phone</label><input id="maPhone"></div>
       <div class="field"><label>Amount Paid</label><input type="number" id="maPaid" min="0"></div>
-      <div class="field"><label>Total Value of Goods (optional)</label><input type="number" id="maTotal" min="0" placeholder="Leave blank if unknown"></div>
     </div>
     <div class="section-head" style="margin-top:10px"><h3 style="font-size:13.5px">Products Reserved</h3>
       <button class="btn btn-ghost btn-sm" id="maAddRow">+ Add product</button></div>
     <div id="maRows"></div>
+    <div class="cart-row total" style="margin-top:8px"><span>Total Value of Goods</span><span id="maTotalDisplay">₦0.00</span></div>
     <div class="field" style="margin-top:10px"><label>Notes</label><textarea id="maNotes"></textarea></div>
   </div>
   <div class="modal-foot"><button class="btn btn-ghost" onclick="window.__closeModal()">Cancel</button>
   <button class="btn btn-primary" id="maSave">Save</button></div>`, {lg:true});
   const rows = document.getElementById("maRows");
+  // Recomputes one row's line total (exact catalogue price × quantity) and
+  // then the overall "Total Value of Goods" from every row — this is the
+  // single source of truth the Save button reads from, so what's shown on
+  // screen is always exactly what gets saved.
+  const updateGrandTotal = ()=>{
+    const grand = [...rows.children].reduce((sum,r)=> sum + (+r.dataset.lineTotal||0), 0);
+    document.getElementById("maTotalDisplay").textContent = money(grand);
+  };
+  const updateRowTotal = (row)=>{
+    const prodSel = row.querySelector(".maProd"), unitSel = row.querySelector(".maUnit"), qtyInput = row.querySelector(".maQty");
+    const p = state.products.find(x=>x.id===prodSel.value);
+    const unit = unitSel.value;
+    const qty = Math.max(0, +qtyInput.value||0);
+    const unitPrice = p ? unitPriceFor(p, unit) : 0;
+    const lineTotal = unitPrice * qty;
+    row.dataset.lineTotal = lineTotal;
+    row.querySelector(".maUnitPrice").textContent = `@ ${money(unitPrice)}`;
+    row.querySelector(".maLineTotal").textContent = money(lineTotal);
+    updateGrandTotal();
+  };
   const addRow = ()=>{
     if(!state.products.length) return toast("Add a product first","warn");
     const row = document.createElement("div");
-    row.style.cssText = "display:flex;gap:8px;margin-bottom:6px;align-items:center;";
-    row.innerHTML = `<select class="maProd" style="flex:2;padding:7px;border-radius:8px;border:1px solid var(--line)">${state.products.map(p=>`<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("")}</select>
+    row.style.cssText = "display:flex;gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap";
+    row.innerHTML = `<select class="maProd" style="flex:2;min-width:140px;padding:7px;border-radius:8px;border:1px solid var(--line)">${state.products.map(p=>`<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("")}</select>
       <input class="maQty" type="number" min="0.01" step="0.01" value="1" style="width:80px;padding:7px;border-radius:8px;border:1px solid var(--line)">
-      <select class="maUnit" style="width:130px;padding:7px;border-radius:8px;border:1px solid var(--line)"></select>
+      <select class="maUnit" style="width:120px;padding:7px;border-radius:8px;border:1px solid var(--line)"></select>
+      <span class="maUnitPrice" style="font-size:11.5px;color:var(--ink-soft);white-space:nowrap;min-width:90px"></span>
+      <span class="maLineTotal" style="font-size:13px;font-weight:600;min-width:95px;text-align:right"></span>
       <button class="icon-sm remRow">✕</button>`;
-    const prodSel = row.querySelector(".maProd"), unitSel = row.querySelector(".maUnit");
-    const fillUnits = ()=>{ const p = state.products.find(x=>x.id===prodSel.value); unitSel.innerHTML = sellableUnits(p).map(u=>`<option>${u.unit}</option>`).join(""); };
-    prodSel.addEventListener("change", fillUnits); fillUnits();
-    row.querySelector(".remRow").onclick = ()=> row.remove();
+    const prodSel = row.querySelector(".maProd"), unitSel = row.querySelector(".maUnit"), qtyInput = row.querySelector(".maQty");
+    const fillUnits = ()=>{ const p = state.products.find(x=>x.id===prodSel.value); unitSel.innerHTML = sellableUnits(p).map(u=>`<option>${u.unit}</option>`).join(""); updateRowTotal(row); };
+    prodSel.addEventListener("change", fillUnits);
+    unitSel.addEventListener("change", ()=>updateRowTotal(row));
+    qtyInput.addEventListener("input", ()=>updateRowTotal(row));
+    fillUnits();
+    row.querySelector(".remRow").onclick = ()=>{ row.remove(); updateGrandTotal(); };
     rows.appendChild(row);
   };
   addRow();
@@ -2419,9 +2444,12 @@ window.openManualAdvanceModal = function(){
       }
     }
     const paid = Math.max(0, +document.getElementById("maPaid").value||0);
-    const totalVal = document.getElementById("maTotal").value ? Math.max(0, +document.getElementById("maTotal").value) : null;
-    const balance = totalVal!==null ? Math.max(0, totalVal-paid) : 0;
-    const creditBalance = totalVal!==null ? Math.max(0, paid-totalVal) : 0;
+    // The Total Value of Goods is never manually typed — it's the exact
+    // sum of each reserved product's catalogue price × quantity, the same
+    // number shown live in the modal above.
+    const totalVal = +(products.reduce((sum,p)=>sum + p.unitPrice*p.reserved, 0).toFixed(2));
+    const balance = Math.max(0, +(totalVal-paid).toFixed(2));
+    const creditBalance = Math.max(0, +(paid-totalVal).toFixed(2));
     const adv = { id:genId("adv"), customerId:customer.id, customerName:customer.name, phone:customer.phone||phoneInput,
       saleId:null, receiptNumber:"ADV-"+Date.now().toString().slice(-8), amountPaid:paid, total:totalVal, balance, creditBalance,
       products, collectionStatus:"Not Collected", notes:document.getElementById("maNotes").value.trim(), createdAt:Date.now() };
@@ -2573,9 +2601,20 @@ window.viewAdvance = function(id){
   const adv = state.advances.find(a=>a.id===id);
   if(!adv.creditBalance) adv.creditBalance = 0;
   const owedForCollected = Math.max(0, +(advCollectedValue(adv)-adv.amountPaid).toFixed(2));
+  const isManual = !adv.saleId;
+  // Same "keep the price it was originally reserved at" rule used when
+  // saving (advSave below) — reused here so the live price/line-total
+  // shown while editing always matches what will actually be recorded.
+  const rowUnitPrice = (productName, unit, existingIdx)=>{
+    const prior = existingIdx>=0 ? adv.products[existingIdx] : null;
+    if(prior && prior.productName===productName && prior.unit===unit && prior.unitPrice!=null) return prior.unitPrice;
+    const product = state.products.find(x=>x.name===productName);
+    return product ? unitPriceFor(product, unit) : 0;
+  };
   const rowHtml = (p, idx)=>{
     const product = state.products.find(x=>x.name===p.productName);
     const units = product ? sellableUnits(product) : [{unit:p.unit}];
+    const unitPrice = rowUnitPrice(p.productName, p.unit, idx);
     return `<div class="adv-prod-row" data-idx="${idx}" style="display:flex;gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap">
       <select class="advProdSel" style="flex:2;min-width:140px;padding:7px;border-radius:8px;border:1px solid var(--line)">
         ${state.products.map(pr=>`<option value="${escapeHtml(pr.name)}" ${pr.name===p.productName?"selected":""}>${escapeHtml(pr.name)}</option>`).join("")}
@@ -2584,6 +2623,8 @@ window.viewAdvance = function(id){
       <select class="advUnitSel" style="width:110px;padding:7px;border-radius:8px;border:1px solid var(--line)">
         ${units.map(u=>`<option ${u.unit===p.unit?"selected":""}>${u.unit}</option>`).join("")}
       </select>
+      <span class="advUnitPrice" style="font-size:11.5px;color:var(--ink-soft);white-space:nowrap;min-width:85px">@ ${money(unitPrice)}</span>
+      <span class="advLineTotal" style="font-size:13px;font-weight:600;min-width:95px;text-align:right">${money(unitPrice*p.reserved)}</span>
       <span style="font-size:11.5px;color:var(--ink-soft);white-space:nowrap">Collected: ${fmtQty(p.collected)}</span>
       <input class="advCollectNow" type="number" min="0" max="${Math.max(0,p.reserved-p.collected)}" step="0.01" placeholder="Collect now" style="width:95px;padding:7px;border-radius:8px;border:1px solid var(--line)">
       <button class="icon-sm advRemRow" title="${p.collected>0?'Cannot remove — already partially collected':'Remove product'}" ${p.collected>0?"disabled":""}>✕</button>
@@ -2598,11 +2639,14 @@ window.viewAdvance = function(id){
     </div>
     ${owedForCollected>0.009 ? `<div class="pay-detail-note" style="background:var(--danger-light);color:var(--danger);border-radius:8px;padding:9px 12px;margin-bottom:14px">
       ⚠️ Customer has collected <b>${money(owedForCollected)}</b> worth of goods beyond what they've paid for. This has been automatically recorded as a debt in <b>Credit & Advance → Credit Sales (Debtors)</b>.</div>` : ""}
-    <div class="field"><label>Total Value of Goods (optional)</label><input type="number" id="advTotal" min="0" value="${adv.total!==null&&adv.total!==undefined?adv.total:''}" placeholder="Leave blank if unknown" ${can("editCreditRecords")?"":"readonly style=\"background:var(--line)\""}>
-      ${can("editCreditRecords")?"":`<p style="font-size:11px;color:var(--ink-soft);margin-top:4px">🔒 Only an Admin can change the goods' total value.</p>`}</div>
     <div class="section-head" style="margin-top:10px"><h3 style="font-size:13.5px">Reserved Products</h3>
       <button class="btn btn-ghost btn-sm" id="advAddRow">+ Add product</button></div>
     <div id="advRows">${adv.products.map(rowHtml).join("")}</div>
+    <div class="cart-row total" style="margin-top:4px"><span>${isManual?"Total Value of Goods":"Reserved goods value (at list price)"}</span><span id="advGoodsValueDisplay">₦0.00</span></div>
+    ${isManual
+      ? `<p style="font-size:11px;color:var(--ink-soft);margin-top:4px">Calculated automatically from each product's exact price × quantity above.</p>`
+      : `<div class="field" style="margin-top:8px"><label>Actual Sale Total (used for balance/credit)</label><input type="number" id="advTotal" min="0" value="${adv.total!==null&&adv.total!==undefined?adv.total:''}" placeholder="Leave blank if unknown" ${can("editCreditRecords")?"":"readonly style=\"background:var(--line)\""}>
+      <p style="font-size:11px;color:var(--ink-soft);margin-top:4px">${can("editCreditRecords")?"This came from the original sale and may include a discount or tax, so it can differ from the list-price value above.":"🔒 Only an Admin can change the goods' total value."}</p></div>`}
     <p style="font-size:11.5px;color:var(--ink-soft);margin-top:4px">If a customer collects more product value than they've paid for, the shortfall is automatically moved into the Credit & Advance debtors ledger when you hit Save.</p>
     <div class="field" style="margin-top:12px"><label>Additional Payment Now (optional)</label><input type="number" id="advExtraPay" min="0" value="0">
       <p style="font-size:11.5px;color:var(--ink-soft);margin-top:4px">You can pay more than the outstanding balance — any excess is added to Store Credit.</p></div>
@@ -2612,21 +2656,44 @@ window.viewAdvance = function(id){
   <button class="btn btn-primary" id="advSave">Save</button></div>`, {lg:true});
 
   const rowsHost = document.getElementById("advRows");
+  // Recomputes one row's displayed unit price/line total, then the overall
+  // "goods value" figure shown just under the products list.
+  const updateGoodsValue = ()=>{
+    const grand = [...rowsHost.children].reduce((sum,r)=> sum + (+r.dataset.lineTotal||0), 0);
+    document.getElementById("advGoodsValueDisplay").textContent = money(grand);
+  };
+  const updateRowTotal = (row)=>{
+    const existingIdx = +row.dataset.idx;
+    const productName = row.querySelector(".advProdSel").value;
+    const unit = row.querySelector(".advUnitSel").value;
+    const qty = Math.max(0, +row.querySelector(".advResQty").value||0);
+    const unitPrice = rowUnitPrice(productName, unit, existingIdx);
+    const lineTotal = unitPrice * qty;
+    row.dataset.lineTotal = lineTotal;
+    row.querySelector(".advUnitPrice").textContent = `@ ${money(unitPrice)}`;
+    row.querySelector(".advLineTotal").textContent = money(lineTotal);
+    updateGoodsValue();
+  };
   const wireRow = (row)=>{
-    const prodSel = row.querySelector(".advProdSel"), unitSel = row.querySelector(".advUnitSel");
+    const prodSel = row.querySelector(".advProdSel"), unitSel = row.querySelector(".advUnitSel"), qtyInput = row.querySelector(".advResQty");
     prodSel.addEventListener("change", ()=>{
       const p = state.products.find(x=>x.name===prodSel.value);
       unitSel.innerHTML = sellableUnits(p).map(u=>`<option>${u.unit}</option>`).join("");
+      updateRowTotal(row);
     });
-    row.querySelector(".advRemRow").addEventListener("click", ()=>{ if(!row.querySelector(".advRemRow").disabled) row.remove(); });
+    unitSel.addEventListener("change", ()=>updateRowTotal(row));
+    qtyInput.addEventListener("input", ()=>updateRowTotal(row));
+    row.querySelector(".advRemRow").addEventListener("click", ()=>{ if(!row.querySelector(".advRemRow").disabled){ row.remove(); updateGoodsValue(); } });
+    row.dataset.lineTotal = rowUnitPrice(prodSel.value, unitSel.value, +row.dataset.idx) * (+qtyInput.value||0);
   };
   [...rowsHost.children].forEach(wireRow);
+  updateGoodsValue();
   document.getElementById("advAddRow").addEventListener("click", ()=>{
     if(!state.products.length) return toast("Add a product first","warn");
     const div = document.createElement("div");
     div.innerHTML = rowHtml({productName:state.products[0].name, reserved:1, unit:sellableUnits(state.products[0])[0]?.unit||"", collected:0}, -1);
     const row = div.firstElementChild;
-    rowsHost.appendChild(row); wireRow(row);
+    rowsHost.appendChild(row); wireRow(row); updateGoodsValue();
   });
 
   document.getElementById("advSave").onclick = async ()=>{
@@ -2696,10 +2763,15 @@ window.viewAdvance = function(id){
 
     adv.products = newProducts.map(({__priorIdx, ...rest})=>rest);
 
-    // Only an Admin (editCreditRecords) may change the goods' total value —
-    // the input is also rendered read-only for anyone else, this is a
-    // defense-in-depth check against the stored value being altered.
-    if(can("editCreditRecords")){
+    // For manual advances, the Total Value is never typed — it's always
+    // the exact sum of each reserved product's price × quantity, matching
+    // the live figure shown in the modal above. For advances that came
+    // from an actual sale (which may include a discount/tax the unit
+    // prices alone can't reconstruct), the real sale total is preserved
+    // and only an Admin may override it.
+    if(isManual){
+      adv.total = +(adv.products.reduce((sum,p)=>sum + p.unitPrice*p.reserved, 0).toFixed(2));
+    } else if(can("editCreditRecords")){
       const totalInput = document.getElementById("advTotal").value;
       adv.total = totalInput ? Math.max(0, +totalInput) : null;
     }
