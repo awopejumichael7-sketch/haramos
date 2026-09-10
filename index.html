@@ -693,8 +693,8 @@ const USERS = [
 ];
 
 const PERMISSIONS = {
-  admin: { deleteProducts:true, editUsers:true, changeSettings:true, deleteSales:true, priceOverride:true },
-  sales: { deleteProducts:false, editUsers:false, changeSettings:false, deleteSales:false, priceOverride:false }
+  admin: { deleteProducts:true, editUsers:true, changeSettings:true, deleteSales:true, priceOverride:true, editCreditRecords:true },
+  sales: { deleteProducts:false, editUsers:false, changeSettings:false, deleteSales:false, priceOverride:false, editCreditRecords:false }
 };
 
 const STORE = { name:"HARAMOS ENTERPRISE", phone:"08060004726", address:"5 Oke Aro Street, Ikangba Town, Odogbolu, Ogun State", footer:"Thank you for shopping with us!",
@@ -730,7 +730,7 @@ const SEED_PRODUCTS = [];
 const state = {
   user: null, page: "dashboard", cart: [], activeCustomer: null,
   products: [], customers: [], suppliers: [], sales: [], expenses: [],
-  debts: [], advances: [], receipts: [], settings: {}, idleTimer: null,
+  debts: [], advances: [], receipts: [], payments: [], settings: {}, idleTimer: null,
   theme: localStorage.getItem("pos_theme") || "light",
 };
 
@@ -824,6 +824,7 @@ async function reloadAll(){
   state.debts = await dataGetAll("debts");
   state.advances = await dataGetAll("advancePayments");
   state.receipts = await dataGetAll("receipts");
+  state.payments = await dataGetAll("payments");
   const storeSettings = await idbGet("settings", "store_info");
   state.settings = storeSettings || STORE;
 }
@@ -1167,10 +1168,16 @@ function wireGlobalEvents(){
   overlay.addEventListener("click", closeSidebar);
   window.__closeMobileSidebar = closeSidebar;
 }
+// A debt is "overdue" once its due date has passed and it still has a
+// balance owing. This is the only place this check happens — kept as a
+// single helper so the notification dot, the panel, and the Debtors table
+// can never disagree with each other.
+function isDebtOverdue(d){ return !!(d && d.dueDate && (d.balance||0) > 0.009 && new Date(d.dueDate).getTime() < Date.now()); }
 async function checkNotifications(){
   const lowStock = state.products.filter(p=> unitStockInPieces(p) <= (p.minStock||0) );
+  const overdueDebts = state.debts.filter(isDebtOverdue);
   const dot = document.getElementById("notifDot");
-  const hasAlerts = lowStock.length>0;
+  const hasAlerts = lowStock.length>0 || overdueDebts.length>0;
   dot.classList.toggle("hidden", !hasAlerts);
 }
 function unitStockInPieces(p){ return p.currentStock; }
@@ -1178,6 +1185,7 @@ function showNotificationsPanel(){
   const lowStock = state.products.filter(p=> p.currentStock <= (p.minStock||0));
   const outStock = state.products.filter(p=> p.currentStock <= 0);
   const debts = state.debts.filter(d=> d.balance > 0);
+  const overdueDebts = debts.filter(isDebtOverdue);
   const pendingAdv = state.advances.filter(a=> a.collectionStatus !== "Fully Collected");
   let html = `<div class="modal-head"><h3>Notifications</h3><button class="close-x" onclick="window.__closeModal()">✕</button></div>
   <div class="modal-body">`;
@@ -1185,6 +1193,7 @@ function showNotificationsPanel(){
     rows.slice(0,6).map(render).join("") : "";
   html += section("⚠️ Low Stock", lowStock, p=>`<div class="cart-line-sub">${p.name} — ${fmtQty(p.currentStock)} ${p.stockUnit} left</div>`);
   html += section("⛔ Out of Stock", outStock, p=>`<div class="cart-line-sub">${p.name}</div>`);
+  html += section("⏰ Overdue Debts", overdueDebts, d=>`<div class="cart-line-sub">${d.customerName} — ${money(d.balance)} was due ${new Date(d.dueDate).toLocaleDateString("en-NG",{day:"2-digit",month:"short",year:"numeric"})}</div>`);
   html += section("💰 Outstanding Debts", debts, d=>`<div class="cart-line-sub">${d.customerName} owes ${money(d.balance)}</div>`);
   html += section("📦 Pending Collections", pendingAdv, a=>`<div class="cart-line-sub">${a.customerName} — ${a.collectionStatus}</div>`);
   if(!lowStock.length && !outStock.length && !debts.length && !pendingAdv.length) html += `<p style="color:var(--ink-soft);font-size:13px">You're all caught up. No alerts right now.</p>`;
@@ -1218,6 +1227,12 @@ function renderDashboard(){
   const debtors = state.debts.filter(d=>d.balance>0);
   const advances = state.advances.filter(a=>a.collectionStatus!=="Fully Collected");
   const needsPricing = state.products.filter(p=>p.needsPricing).length;
+  // Currency totals for receivables — counts alone ("Debtors: 3") don't
+  // answer "how much money am I actually owed right now", so these are
+  // shown alongside the existing count-based cards, none of which are removed.
+  const totalDebtOwed = state.debts.reduce((a,d)=>a+Math.max(0,d.balance||0),0);
+  const overdueDebts = state.debts.filter(isDebtOverdue);
+  const totalStoreCredit = state.advances.reduce((a,adv)=>a+Math.max(0,adv.creditBalance||0),0);
 
   const cards = [
     {lbl:"Today's Sales", val:money(todaySalesTotal), ic:"💰", bg:"var(--brand-light)", fg:"var(--brand-dark)"},
@@ -1228,7 +1243,10 @@ function renderDashboard(){
     {lbl:"Total Products", val:state.products.length, ic:"📦", bg:"var(--info-light)", fg:"var(--info)"},
     {lbl:"Customers", val:state.customers.length, ic:"👥", bg:"var(--ok-light)", fg:"var(--ok)"},
     {lbl:"Debtors", val:debtors.length, ic:"🧾", bg:"var(--danger-light)", fg:"var(--danger)"},
+    {lbl:"Total Owed by Debtors", val:money(totalDebtOwed), ic:"📕", bg:"var(--danger-light)", fg:"var(--danger)"},
+    {lbl:"Overdue Debts", val:overdueDebts.length, ic:"⏰", bg:"var(--danger-light)", fg:"var(--danger)"},
     {lbl:"Advance Payments", val:advances.length, ic:"💳", bg:"var(--gold-light)", fg:"var(--warn)"},
+    {lbl:"Store Credit Owed", val:money(totalStoreCredit), ic:"🎟️", bg:"var(--gold-light)", fg:"var(--warn)"},
     {lbl:"Low Stock", val:lowStock.length, ic:"⚠️", bg:"var(--warn-light)", fg:"var(--warn)"},
     {lbl:"Pending Orders", val:advances.length, ic:"⏳", bg:"var(--info-light)", fg:"var(--info)"},
     {lbl:"Needs Pricing", val:needsPricing, ic:"🏷️", bg:"var(--danger-light)", fg:"var(--danger)"},
@@ -1346,6 +1364,16 @@ const PAYMENT_METHOD_ICONS = {
   "Split Payment":"🔀","Advance Payment":"⏳","Credit":"🧾"
 };
 
+// Total spendable store credit a customer has accumulated across every
+// Advance Payment record on file for them (e.g. from having overpaid a
+// prior deposit). This is the single source of truth for "how much store
+// credit can this customer redeem right now" — used both at checkout and
+// on the Customer profile.
+function customerStoreCredit(customerId){
+  if(!customerId) return 0;
+  return state.advances.filter(a=>a.customerId===customerId).reduce((sum,a)=>sum+Math.max(0,a.creditBalance||0),0);
+}
+
 /* Renders the contextual info / input panel under the payment method
    radios, based on whichever method is currently selected. Keeps all
    the "necessary information" (customer requirement, partial-payment
@@ -1359,35 +1387,44 @@ function updatePayDetails(){
   const total = state.cart.reduce((a,c)=>a+c.qty*c.unitPrice,0) - (+(document.getElementById("discountInput")?.value||0));
   const taxPct = +(document.getElementById("taxInput")?.value||0);
   const grandTotal = Math.max(0,total) * (1+taxPct/100);
+  // Store credit, if applied, reduces only what still needs to be collected
+  // by the chosen payment method below — it never changes the real total.
+  const creditAvail = state.activeCustomer ? customerStoreCredit(state.activeCustomer.id) : 0;
+  const creditApplied = Math.min(creditAvail, grandTotal, Math.max(0, +(document.getElementById("storeCreditApply")?.value||0)));
+  const dueAfterCredit = Math.max(0, grandTotal - creditApplied);
+  const creditNote = creditApplied>0.009 ? `<p class="pay-detail-note">🎟️ Store credit of <b>${money(creditApplied)}</b> applied — <b>${money(dueAfterCredit)}</b> still due below.</p>` : "";
 
   if(COMBO_METHODS[method]){
     const parts = COMBO_METHODS[method];
     host.innerHTML = `<div class="pay-detail-box">
-      <p class="pay-detail-note">Enter how much was paid by each method. They should add up to the total (${money(grandTotal)}). If they fall short, the remainder is recorded as credit — select a customer first.</p>
+      ${creditNote}
+      <p class="pay-detail-note">Enter how much was paid by each method. They should add up to the amount due (${money(dueAfterCredit)}). If they fall short, the remainder is recorded as credit — select a customer first.</p>
       ${parts.map((p,i)=>`<div class="cart-row"><span>${escapeHtml(p)}</span>
-        <input type="number" class="comboAmt" data-method="${escapeHtml(p)}" min="0" value="${i===0?fmtQty(grandTotal):0}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>`).join("")}
+        <input type="number" class="comboAmt" data-method="${escapeHtml(p)}" min="0" value="${i===0?fmtQty(dueAfterCredit):0}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>`).join("")}
       <div class="cart-row total"><span>Remaining</span><span id="comboRemaining">${money(0)}</span></div>
     </div>`;
     const updateRemaining = ()=>{
       const sum = [...host.querySelectorAll(".comboAmt")].reduce((a,i)=>a+(+i.value||0),0);
-      document.getElementById("comboRemaining").textContent = money(Math.max(0, grandTotal-sum));
+      document.getElementById("comboRemaining").textContent = money(Math.max(0, dueAfterCredit-sum));
     };
     host.querySelectorAll(".comboAmt").forEach(i=> i.addEventListener("input", updateRemaining));
     updateRemaining();
   } else if(method==="Split Payment"){
-    host.innerHTML = `<div class="pay-detail-box"><p class="pay-detail-note">You'll break the payment down across any combination of methods in a popup right after you click "Charge & Print". If the total entered is less than the amount due, select a customer so the shortfall can be saved as credit.</p></div>`;
+    host.innerHTML = `<div class="pay-detail-box">${creditNote}<p class="pay-detail-note">You'll break the payment down across any combination of methods in a popup right after you click "Charge & Print". If the total entered is less than the amount due, select a customer so the shortfall can be saved as credit.</p></div>`;
   } else if(method==="Credit"){
     host.innerHTML = `<div class="pay-detail-box">
+      ${creditNote}
       <p class="pay-detail-note">${state.activeCustomer? "Customer: <b>"+escapeHtml(state.activeCustomer.name)+"</b>." : "⚠️ Select a customer above — Credit sales must be linked to a customer."} Enter anything paid now; the rest is saved as a debt on their account.</p>
-      <div class="cart-row"><span>Amount Paid Now</span><input type="number" id="creditPaidNow" min="0" max="${grandTotal}" value="0" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
+      <div class="cart-row"><span>Amount Paid Now</span><input type="number" id="creditPaidNow" min="0" max="${dueAfterCredit}" value="0" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
     </div>`;
   } else if(method==="Advance Payment"){
     host.innerHTML = `<div class="pay-detail-box">
-      <p class="pay-detail-note">${state.activeCustomer? "Customer: <b>"+escapeHtml(state.activeCustomer.name)+"</b>." : "⚠️ Select a customer above — Advance Payments must be linked to a customer."} Goods are reserved and collected later. Enter what's paid today (defaults to the full total). You can pay <b>more than the total</b> — the extra is kept as store credit on the customer's account.</p>
-      <div class="cart-row"><span>Amount Paid Now</span><input type="number" id="advPaidNow" min="0" value="${fmtQty(grandTotal)}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
+      ${creditNote}
+      <p class="pay-detail-note">${state.activeCustomer? "Customer: <b>"+escapeHtml(state.activeCustomer.name)+"</b>." : "⚠️ Select a customer above — Advance Payments must be linked to a customer."} Goods are reserved and collected later. Enter what's paid today (defaults to the full amount due). You can pay <b>more than the amount due</b> — the extra is kept as store credit on the customer's account.</p>
+      <div class="cart-row"><span>Amount Paid Now</span><input type="number" id="advPaidNow" min="0" value="${fmtQty(dueAfterCredit)}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
     </div>`;
   } else {
-    host.innerHTML = "";
+    host.innerHTML = creditNote ? `<div class="pay-detail-box">${creditNote}</div>` : "";
   }
 }
 
@@ -1433,6 +1470,10 @@ async function renderSales(){
           <div class="cart-row"><span>Subtotal</span><span id="sumSub">₦0.00</span></div>
           <div class="cart-row"><span>Tax</span><span id="sumTax">₦0.00</span></div>
           <div class="cart-row total"><span>Total</span><span id="sumTotal">₦0.00</span></div>
+          <div class="cart-row" id="storeCreditRow" style="display:none">
+            <span>Apply Store Credit <span id="storeCreditAvail" style="color:var(--ink-soft);font-size:11px"></span></span>
+            <input id="storeCreditApply" type="number" min="0" value="0" class="cart-num-input">
+          </div>
           <div class="pay-group-label">Payment Method</div>
           <div class="paymethods" id="payMethods"></div>
           <div class="pay-group-label">Combo &amp; Credit</div>
@@ -1472,6 +1513,7 @@ async function renderSales(){
   document.getElementById("clearCartBtn").addEventListener("click", ()=> confirmDialog("Clear all items from the current sale?", ()=>{ state.cart=[]; state.activeCustomer=null; renderCart(); }));
   document.getElementById("discountInput").addEventListener("input", renderCart);
   document.getElementById("taxInput").addEventListener("input", renderCart);
+  document.getElementById("storeCreditApply").addEventListener("input", updatePayDetails);
   document.getElementById("holdBtn").addEventListener("click", holdSale);
   document.getElementById("checkoutBtn").addEventListener("click", checkout);
   document.getElementById("heldBtn").addEventListener("click", showHeldSales);
@@ -1577,6 +1619,21 @@ function renderCart(){
     mcbTotal.textContent = money(total);
     document.getElementById("mobileCartBar").classList.toggle("show", state.cart.length>0);
   }
+  const creditRow = document.getElementById("storeCreditRow");
+  if(creditRow){
+    const avail = state.activeCustomer ? customerStoreCredit(state.activeCustomer.id) : 0;
+    const creditInput = document.getElementById("storeCreditApply");
+    if(avail>0.009){
+      creditRow.style.display = "";
+      document.getElementById("storeCreditAvail").textContent = `(${money(avail)} available)`;
+      const cap = Math.min(avail, total);
+      creditInput.max = cap.toFixed(2);
+      if(+creditInput.value > cap) creditInput.value = cap.toFixed(2);
+    } else {
+      creditRow.style.display = "none";
+      creditInput.value = 0;
+    }
+  }
   updatePayDetails();
 }
 function showCustomerSuggestions(q){
@@ -1594,7 +1651,7 @@ function showCustomerSuggestions(q){
   box.querySelectorAll("[data-id]").forEach(el=> el.addEventListener("click",()=>{
     state.activeCustomer = state.customers.find(c=>c.id===el.dataset.id);
     document.getElementById("custSearch").value = state.activeCustomer.name; box.remove();
-    updatePayDetails();
+    renderCart();
   }));
   box.querySelector("#newCustQuick").addEventListener("click", ()=> openCustomerModal(null, q));
 }
@@ -1636,6 +1693,14 @@ async function checkout(){
   const total = taxable+tax;
   const notes = document.getElementById("saleNotes").value.trim();
 
+  // Store credit the active customer has available (accumulated from a past
+  // Advance Payment where they paid more than the goods were worth). If
+  // applied, it only reduces how much still needs to be collected by the
+  // chosen payment method below — the sale's real total/value is untouched.
+  const creditAvailable = state.activeCustomer ? customerStoreCredit(state.activeCustomer.id) : 0;
+  const creditApplied = Math.min(creditAvailable, total, Math.max(0, +(document.getElementById("storeCreditApply")?.value||0)));
+  const payDue = Math.max(0, total - creditApplied);
+
   // validate & compute stock deductions, prevent overselling / negative stock
   const lines = [];
   for(const c of state.cart){
@@ -1649,19 +1714,19 @@ async function checkout(){
       qtyInStockUnit:deduction, unitPrice:c.unitPrice, unitCost:product.costPrice });
   }
 
-  let amountPaid = total, balance = 0, paymentBreakdown = null;
+  let amountPaid = payDue, balance = 0, paymentBreakdown = null;
   if(method==="Credit"){
     if(!state.activeCustomer){ toast(`Select or add a customer first — ${method} needs a customer on file.`, "err"); return; }
-    const paid = Math.min(total, Math.max(0, +document.getElementById("creditPaidNow")?.value||0));
-    amountPaid = paid; balance = total-paid;
+    const paid = Math.min(payDue, Math.max(0, +document.getElementById("creditPaidNow")?.value||0));
+    amountPaid = paid; balance = payDue-paid;
   } else if(method==="Advance Payment"){
     if(!state.activeCustomer){ toast(`Select or add a customer first — ${method} needs a customer on file.`, "err"); return; }
     const paid = Math.max(0, +document.getElementById("advPaidNow")?.value||0);
-    amountPaid = paid; balance = Math.max(0, total-paid);
+    amountPaid = paid; balance = Math.max(0, payDue-paid);
   } else if(method==="Split Payment"){
-    const res = await promptSplitPaymentModal(total);
+    const res = await promptSplitPaymentModal(payDue);
     if(res===null) return;
-    paymentBreakdown = res.lines; amountPaid = res.total; balance = total-res.total;
+    paymentBreakdown = res.lines; amountPaid = res.total; balance = payDue-res.total;
     if(balance>0.009 && !state.activeCustomer){
       toast("Split payment is short of the total — select a customer to record the remaining balance as credit.", "err");
       return;
@@ -1670,13 +1735,17 @@ async function checkout(){
     const rows = [...document.querySelectorAll(".comboAmt")].map(i=>({ method:i.dataset.method, amount:Math.max(0,+i.value||0) })).filter(l=>l.amount>0);
     if(!rows.length){ toast("Enter at least one amount for the payment breakdown","err"); return; }
     const sum = rows.reduce((a,l)=>a+l.amount,0);
-    if(sum > total + 0.01){ toast("The amounts entered exceed the total due","err"); return; }
-    paymentBreakdown = rows; amountPaid = sum; balance = total-sum;
+    if(sum > payDue + 0.01){ toast("The amounts entered exceed the amount due","err"); return; }
+    paymentBreakdown = rows; amountPaid = sum; balance = payDue-sum;
     if(balance>0.009 && !state.activeCustomer){
-      toast(`${method} is short of the total — select a customer to record the remaining balance as credit.`, "err");
+      toast(`${method} is short of the amount due — select a customer to record the remaining balance as credit.`, "err");
       return;
     }
   }
+  // Fold the applied store credit into the recorded amountPaid — it was a
+  // real form of payment for this sale, just not new cash. total - amountPaid
+  // still correctly equals balance since balance was derived from payDue.
+  if(creditApplied>0.009) amountPaid = +(amountPaid + creditApplied).toFixed(2);
 
   const receiptNumber = "AGB-" + Date.now().toString().slice(-8);
   const sale = {
@@ -1684,7 +1753,7 @@ async function checkout(){
     cashierId: state.user.id, cashierName: state.user.name,
     customerId: state.activeCustomer?.id||null, customerName: state.activeCustomer?.name||"Walk-in",
     items: lines, subtotal, discount, taxPct, tax, total, amountPaid, balance, paymentBreakdown,
-    paymentMethod: method, notes, status: balance>0.009 ? "Partial/Owing" : "Paid"
+    paymentMethod: method, notes, status: balance>0.009 ? "Partial/Owing" : "Paid", creditApplied
   };
   await dataSet("sales", sale);
   state.sales.push(sale);
@@ -1705,8 +1774,33 @@ async function checkout(){
         method:l.method, amount:l.amount, createdAt:Date.now(), by:state.user.name });
     }
   } else {
-    await dataSet("payments", { id:genId("pay"), type:"sale", saleId:sale.id, receiptNumber,
-      method, amount:amountPaid, createdAt:Date.now(), by:state.user.name });
+    // amountPaid may include folded-in store credit (added above) — the
+    // ledger entry for the tendered method should only reflect the actual
+    // cash/transfer/etc portion, so cash reconciliation isn't inflated.
+    const tenderPaid = +(amountPaid - creditApplied).toFixed(2);
+    if(tenderPaid > 0.009){
+      await dataSet("payments", { id:genId("pay"), type:"sale", saleId:sale.id, receiptNumber,
+        method, amount:tenderPaid, createdAt:Date.now(), by:state.user.name });
+    }
+  }
+
+  // If store credit was applied, actually spend it off the customer's
+  // Advance Payment record(s) — oldest first — and log it in the payments
+  // ledger under its own type, separate from real cash/transfer/POS tender.
+  if(creditApplied>0.009 && state.activeCustomer){
+    let remaining = creditApplied;
+    const customerAdvances = state.advances
+      .filter(a=>a.customerId===state.activeCustomer.id && (a.creditBalance||0)>0.009)
+      .sort((a,b)=>a.createdAt-b.createdAt);
+    for(const adv of customerAdvances){
+      if(remaining<=0.009) break;
+      const take = Math.min(adv.creditBalance, remaining);
+      adv.creditBalance = +(adv.creditBalance-take).toFixed(2);
+      await dataSet("advancePayments", adv);
+      remaining = +(remaining-take).toFixed(2);
+    }
+    await dataSet("payments", { id:genId("pay"), type:"storeCredit", saleId:sale.id, receiptNumber,
+      amount:creditApplied, createdAt:Date.now(), by:state.user.name });
   }
 
   // route the outstanding balance / reservation to the right place
@@ -2015,7 +2109,7 @@ function enrichSaleWithDebt(sale){
   if(!debt) return sale;
   return Object.assign({}, sale, { amountPaid:debt.amountPaid, balance:debt.balance,
     history:debt.history||[], debtId:debt.id,
-    status: debt.balance<=0.009 ? "Paid" : (debt.amountPaid>0 ? "Partial/Owing" : "Owing") });
+    status: debt.writtenOff ? "Written Off" : (debt.balance<=0.009 ? "Paid" : (debt.amountPaid>0 ? "Partial/Owing" : "Owing")) });
 }
 /* Convenience wrapper: apply whichever overlay (debt or advance) applies
    to this sale — a given sale can only ever have one of the two linked. */
@@ -2049,11 +2143,11 @@ function renderReceipts(){
       // Status pill: if this sale has a linked credit/debt record, always reflect its
       // live balance rather than the sale's original (one-time) status field, so the
       // moment a debt is paid down or cleared, Sales History updates automatically.
-      const liveStatus = debt ? (debt.balance<=0.009 ? "Paid" : (debt.amountPaid>0 ? "Partial/Owing" : "Owing")) : s.status;
+      const liveStatus = debt ? (debt.writtenOff ? "Written Off" : (debt.balance<=0.009 ? "Paid" : (debt.amountPaid>0 ? "Partial/Owing" : "Owing"))) : s.status;
       return `
       <tr><td class="mono">${s.receiptNumber}</td><td>${escapeHtml(s.customerName||"Walk-in")}</td>
       <td>${escapeHtml(s.cashierName)}</td><td>${s.items.length}</td><td>${money(s.total)}</td>
-      <td><span class="pill ${liveStatus==="Paid"?"pill-ok":"pill-warn"}">${liveStatus}</span></td>
+      <td><span class="pill ${liveStatus==="Paid"?"pill-ok":liveStatus==="Written Off"?"pill-danger":"pill-warn"}">${liveStatus}</span></td>
       <td>${collectionCell}</td>
       <td>${fmtDate(s.createdAt)}</td>
       <td class="row-actions">
@@ -2120,29 +2214,54 @@ function renderCredit(){
 function drawCreditTab(tab){
   const body = document.getElementById("creditTabBody");
   if(tab==="debts"){
+    const totalOwed = state.debts.reduce((a,d)=>a+Math.max(0,d.balance||0),0);
+    const owingCount = state.debts.filter(d=>d.balance>0.009).length;
     body.innerHTML = `<div class="card"><div class="section-head">
-      <div><h3>Credit Sales (Debtors)</h3><p>Money customers currently owe the store</p></div>
-      <button class="btn btn-primary btn-sm" onclick="openManualDebtModal()">+ Add Credit / Debt</button>
+      <div><h3>Credit Sales (Debtors)</h3><p>${owingCount} account${owingCount===1?"":"s"} owing &middot; Total outstanding: <b>${money(totalOwed)}</b></p></div>
+      <div class="toolbar"><div class="searchbox"><input id="debtSearch" placeholder="Search customer, phone or receipt…"></div>
+      <button class="btn btn-primary btn-sm" onclick="openManualDebtModal()">+ Add Credit / Debt</button></div>
       </div><div class="table-wrap"><table><thead><tr>
-      <th>Customer</th><th>Phone</th><th>Receipt#</th><th>Total</th><th>Paid</th><th>Balance</th><th>Status</th><th></th>
-      </tr></thead><tbody>${state.debts.length? state.debts.map(d=>`
-      <tr><td>${escapeHtml(d.customerName)}${d.advanceId?` <span class="pill pill-warn" title="Auto-recorded: goods collected exceed amount paid" style="font-size:10px">from Advance</span>`:""}</td><td>${escapeHtml(d.phone)}</td><td class="mono">${d.receiptNumber}</td>
-      <td>${money(d.total)}</td><td>${money(d.amountPaid)}</td><td>${money(d.balance)}</td>
-      <td><span class="pill ${d.balance<=0?'pill-ok':'pill-danger'}">${d.balance<=0?'Cleared':'Owing'}</span></td>
-      <td class="row-actions">${d.advanceId?`<button class="icon-sm" title="Open linked Advance Payment" onclick="viewAdvance('${d.advanceId}')">📦</button>`:""}<button class="icon-sm" title="Receipt" onclick="viewDebtReceipt('${d.id}')">🧾</button><button class="btn btn-sm btn-primary" onclick="recordDebtPayment('${d.id}')" ${d.balance<=0?"disabled":""}>Add Payment</button></td>
-      </tr>`).join("") : `<tr><td colspan="8"><div class="empty-state"><div class="ic">💳</div>No credit sales yet</div></td></tr>`}</tbody></table></div></div>`;
+      <th>Customer</th><th>Phone</th><th>Receipt#</th><th>Total</th><th>Paid</th><th>Balance</th><th>Due Date</th><th>Status</th><th></th>
+      </tr></thead><tbody id="debtRows"></tbody></table></div></div>`;
+    const renderRows = ()=>{
+      const q = (document.getElementById("debtSearch").value||"").toLowerCase().trim();
+      const rows = state.debts.filter(d=> !q || d.customerName.toLowerCase().includes(q) || (d.phone||"").toLowerCase().includes(q) || (d.receiptNumber||"").toLowerCase().includes(q));
+      document.getElementById("debtRows").innerHTML = rows.length ? rows.map(d=>{
+        const overdue = isDebtOverdue(d);
+        const statusLabel = d.balance<=0 ? (d.writtenOff?"Written Off":"Cleared") : (overdue?"Overdue":"Owing");
+        const statusClass = d.balance<=0 ? (d.writtenOff?"pill-danger":"pill-ok") : "pill-danger";
+        return `
+        <tr><td>${escapeHtml(d.customerName)}${d.advanceId?` <span class="pill pill-warn" title="Auto-recorded: goods collected exceed amount paid" style="font-size:10px">from Advance</span>`:""}</td><td>${escapeHtml(d.phone)}</td><td class="mono">${d.receiptNumber}</td>
+        <td>${money(d.total)}</td><td>${money(d.amountPaid)}</td><td>${money(d.balance)}</td>
+        <td>${d.dueDate ? `<span ${overdue?'class="pill pill-danger"':''}>${new Date(d.dueDate).toLocaleDateString("en-NG",{day:"2-digit",month:"short",year:"numeric"})}</span>` : "—"}</td>
+        <td><span class="pill ${statusClass}">${statusLabel}</span></td>
+        <td class="row-actions">${d.advanceId?`<button class="icon-sm" title="Open linked Advance Payment" onclick="viewAdvance('${d.advanceId}')">📦</button>`:""}<button class="icon-sm" title="Receipt" onclick="viewDebtReceipt('${d.id}')">🧾</button>${(!d.advanceId && can("editCreditRecords") && d.balance>0.009)?`<button class="icon-sm" title="Write off (uncollectible)" onclick="writeOffDebt('${d.id}')">🚫</button>`:""}${(!d.advanceId && !d.saleId && can("editCreditRecords"))?`<button class="icon-sm" title="Delete record" onclick="deleteManualDebt('${d.id}')">🗑️</button>`:""}<button class="btn btn-sm btn-primary" onclick="recordDebtPayment('${d.id}')" ${d.balance<=0?"disabled":""}>Add Payment</button></td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="9"><div class="empty-state"><div class="ic">💳</div>No credit sales yet</div></td></tr>`;
+    };
+    document.getElementById("debtSearch").addEventListener("input", renderRows);
+    renderRows();
   } else {
+    const totalCredit = state.advances.reduce((a,adv)=>a+Math.max(0,adv.creditBalance||0),0);
     body.innerHTML = `<div class="card"><div class="section-head">
-      <div><h3>Advance Payments</h3><p>Money customers paid ahead of collecting goods</p></div>
-      <button class="btn btn-primary btn-sm" onclick="openManualAdvanceModal()">+ Add Advance Payment</button>
+      <div><h3>Advance Payments</h3><p>${state.advances.length} record${state.advances.length===1?"":"s"} &middot; Store credit outstanding: <b>${money(totalCredit)}</b></p></div>
+      <div class="toolbar"><div class="searchbox"><input id="advSearch" placeholder="Search customer or receipt…"></div>
+      <button class="btn btn-primary btn-sm" onclick="openManualAdvanceModal()">+ Add Advance Payment</button></div>
       </div><div class="table-wrap"><table><thead><tr>
       <th>Customer</th><th>Receipt#</th><th>Paid</th><th>Balance</th><th>Store Credit</th><th>Status</th><th></th>
-      </tr></thead><tbody>${state.advances.length? state.advances.map(a=>`
+      </tr></thead><tbody id="advRowsBody"></tbody></table></div></div>`;
+    const renderRows = ()=>{
+      const q = (document.getElementById("advSearch").value||"").toLowerCase().trim();
+      const rows = state.advances.filter(a=> !q || a.customerName.toLowerCase().includes(q) || (a.receiptNumber||"").toLowerCase().includes(q));
+      document.getElementById("advRowsBody").innerHTML = rows.length ? rows.map(a=>`
       <tr><td>${escapeHtml(a.customerName)}</td><td class="mono">${a.receiptNumber}</td><td>${money(a.amountPaid)}</td>
-      <td>${money(a.balance)}</td><td>${(a.creditBalance||0)>0?`<span class="pill pill-ok">${money(a.creditBalance)}</span>`:money(0)}</td>
+      <td>${a.total===null||a.total===undefined?`<span class="pill pill-warn" title="Goods value not set — balance can't be calculated yet">Unknown</span>`:money(a.balance)}</td><td>${(a.creditBalance||0)>0?`<span class="pill pill-ok">${money(a.creditBalance)}</span>`:money(0)}</td>
       <td><span class="pill pill-info">${a.collectionStatus}</span></td>
-      <td class="row-actions"><button class="icon-sm" title="Receipt" onclick="viewAdvanceReceipt('${a.id}')">🧾</button><button class="btn btn-sm btn-ghost" onclick="viewAdvance('${a.id}')">Manage</button></td>
-      </tr>`).join("") : `<tr><td colspan="7"><div class="empty-state"><div class="ic">📦</div>No advance payments yet</div></td></tr>`}</tbody></table></div></div>`;
+      <td class="row-actions"><button class="icon-sm" title="Receipt" onclick="viewAdvanceReceipt('${a.id}')">🧾</button>${(!a.saleId && can("editCreditRecords"))?`<button class="icon-sm" title="Delete (restores reserved stock)" onclick="deleteManualAdvance('${a.id}')">🗑️</button>`:""}<button class="btn btn-sm btn-ghost" onclick="viewAdvance('${a.id}')">Manage</button></td>
+      </tr>`).join("") : `<tr><td colspan="7"><div class="empty-state"><div class="ic">📦</div>No advance payments yet</div></td></tr>`;
+    };
+    document.getElementById("advSearch").addEventListener("input", renderRows);
+    renderRows();
   }
 }
 window.openManualDebtModal = function(){
@@ -2285,6 +2404,20 @@ window.openManualAdvanceModal = function(){
       return { productName:p.name, reserved:+r.querySelector(".maQty").value||0, unit, collected:0, unitPrice:unitPriceFor(p, unit) };
     }).filter(p=>p.reserved>0);
     if(!products.length) return toast("Add at least one reserved product","err");
+
+    // Reserve the stock for these goods immediately, exactly the way a
+    // Sales-screen Advance Payment already does — otherwise the same
+    // physical stock stays "available" and could be sold to someone else
+    // while it's earmarked here.
+    for(const p of products){
+      const product = state.products.find(x=>x.name===p.productName);
+      if(!product) continue;
+      const deduction = stockDeductionFor(product, p.unit, p.reserved);
+      if(deduction > product.currentStock + 1e-9){
+        toast(`Not enough stock for ${product.name}. Available: ${fmtQty(product.currentStock)} ${product.stockUnit}`, "err");
+        return;
+      }
+    }
     const paid = Math.max(0, +document.getElementById("maPaid").value||0);
     const totalVal = document.getElementById("maTotal").value ? Math.max(0, +document.getElementById("maTotal").value) : null;
     const balance = totalVal!==null ? Math.max(0, totalVal-paid) : 0;
@@ -2292,9 +2425,18 @@ window.openManualAdvanceModal = function(){
     const adv = { id:genId("adv"), customerId:customer.id, customerName:customer.name, phone:customer.phone||phoneInput,
       saleId:null, receiptNumber:"ADV-"+Date.now().toString().slice(-8), amountPaid:paid, total:totalVal, balance, creditBalance,
       products, collectionStatus:"Not Collected", notes:document.getElementById("maNotes").value.trim(), createdAt:Date.now() };
+    for(const p of products){
+      const product = state.products.find(x=>x.name===p.productName);
+      if(!product) continue;
+      const deduction = stockDeductionFor(product, p.unit, p.reserved);
+      product.currentStock = +(product.currentStock - deduction).toFixed(4);
+      await dataSet("products", product);
+      await dataSet("stockHistory", { id:genId("stk"), productId:product.id, productName:product.name,
+        type:"Advance reserved", change:-deduction, reference:adv.receiptNumber, createdAt:Date.now(), by:state.user.name });
+    }
     await dataSet("advancePayments", adv); state.advances.push(adv);
     await syncAdvanceDebt(adv);
-    closeModal(); toast("Advance payment added","ok"); drawCreditTab("advances");
+    closeModal(); toast("Advance payment added — stock reserved for the customer","ok"); drawCreditTab("advances");
   };
 };
 window.recordDebtPayment = function(id){
@@ -2302,20 +2444,24 @@ window.recordDebtPayment = function(id){
   openModal(`<div class="modal-head"><h3>Record Payment — ${escapeHtml(debt.customerName)}</h3><button class="close-x" onclick="window.__closeModal()">✕</button></div>
   <div class="modal-body">
     <p style="font-size:13px;color:var(--ink-soft)">Current balance: <b>${money(debt.balance)}</b></p>
-    <div class="field"><label>Payment Amount</label><input type="number" id="dbtAmt" min="0" max="${debt.balance}"></div>
+    <div class="form-grid">
+      <div class="field"><label>Payment Amount</label><input type="number" id="dbtAmt" min="0" max="${debt.balance}"></div>
+      <div class="field"><label>Payment Method</label><select id="dbtMethod">${PAYMENT_METHODS_STANDARD.map(m=>`<option>${m}</option>`).join("")}</select></div>
+    </div>
   </div>
   <div class="modal-foot"><button class="btn btn-ghost" onclick="window.__closeModal()">Cancel</button>
   <button class="btn btn-gold" onclick="viewDebtReceipt('${debt.id}')">🧾 Receipt</button>
   <button class="btn btn-primary" id="dbtSave">Save Payment</button></div>`);
   document.getElementById("dbtSave").onclick = async ()=>{
     const amt = Math.min(debt.balance, Math.max(0, +document.getElementById("dbtAmt").value||0));
+    const method = document.getElementById("dbtMethod").value;
     if(debt.advanceId){
       // This debt mirrors the shortfall between goods collected and amount
       // paid on a linked Advance Payment. Settle it by crediting the
       // payment onto the advance itself and re-deriving the balance from
       // that — crediting both the advance AND decrementing debt.balance
       // directly would count the same payment twice.
-      debt.history.push({amount:amt, date:Date.now()});
+      debt.history.push({amount:amt, date:Date.now(), method, by:state.user.name});
       const adv = state.advances.find(a=>a.id===debt.advanceId);
       if(adv){
         adv.amountPaid += amt;
@@ -2327,10 +2473,10 @@ window.recordDebtPayment = function(id){
         await dataSet("debts", debt);
       }
     } else {
-      debt.amountPaid += amt; debt.balance -= amt; debt.history.push({amount:amt, date:Date.now()});
+      debt.amountPaid += amt; debt.balance -= amt; debt.history.push({amount:amt, date:Date.now(), method, by:state.user.name});
       await dataSet("debts", debt);
     }
-    await dataSet("payments", { id:genId("pay"), type:"debt", debtId:debt.id, amount:amt, createdAt:Date.now(), by:state.user.name });
+    await dataSet("payments", { id:genId("pay"), type:"debt", debtId:debt.id, receiptNumber:debt.receiptNumber, method, amount:amt, createdAt:Date.now(), by:state.user.name });
     // Push this payment's progress back onto the original sale so Sales
     // History (and its receipt) automatically reflect the customer's
     // current debit/credit balance instead of the one-time snapshot
@@ -2349,6 +2495,79 @@ window.recordDebtPayment = function(id){
     }
     closeModal(); toast("Payment recorded","ok"); drawCreditTab("debts");
   };
+};
+// Admin-only: mark an uncollectible debt's remaining balance as a write-off
+// rather than a payment, so it disappears from "money still owed" without
+// ever being counted as cash actually received. Only applies to standalone
+// debts (not ones auto-derived from an Advance Payment shortfall, which
+// must be resolved from that record so the two stay in sync).
+window.writeOffDebt = function(id){
+  if(!can("editCreditRecords")){ toast("Only an Admin can write off a debt.", "err"); return; }
+  const debt = state.debts.find(d=>d.id===id);
+  if(!debt) return;
+  if(debt.advanceId){ toast("This balance comes from an Advance Payment — resolve it from that record instead.", "warn"); return; }
+  confirmDialog(`Write off the remaining <b>${money(debt.balance)}</b> owed by <b>${escapeHtml(debt.customerName)}</b>? This marks it as an uncollectible loss (not a payment) and cannot be undone.`, async ()=>{
+    const amount = debt.balance;
+    debt.history = debt.history || [];
+    debt.history.push({ writeOff:true, amount, date:Date.now(), by:state.user.name });
+    debt.writtenOff = true; debt.writeOffAmount = amount; debt.writeOffAt = Date.now(); debt.writeOffBy = state.user.name;
+    debt.balance = 0;
+    await dataSet("debts", debt);
+    if(debt.saleId){
+      const linkedSale = state.sales.find(s=>s.id===debt.saleId);
+      if(linkedSale){
+        linkedSale.balance = 0; linkedSale.status = "Written Off";
+        await dataSet("sales", linkedSale);
+        await dataSet("receipts", { id:linkedSale.id, ...linkedSale });
+        const rxIdx = state.receipts.findIndex(r=>r.id===linkedSale.id);
+        if(rxIdx>-1) state.receipts[rxIdx] = { id:linkedSale.id, ...linkedSale };
+      }
+    }
+    toast("Debt written off","ok"); drawCreditTab("debts");
+  });
+};
+// Admin-only: delete a standalone credit/debt record that was added
+// manually (not one generated by a Sales-screen checkout or an Advance
+// Payment shortfall, both of which must be undone from their own records
+// so linked stock/sale data stays consistent).
+window.deleteManualDebt = function(id){
+  if(!can("editCreditRecords")){ toast("Only an Admin can delete a credit record.", "err"); return; }
+  const debt = state.debts.find(d=>d.id===id);
+  if(!debt) return;
+  if(debt.saleId || debt.advanceId){ toast("This record is linked to a sale or advance — resolve it from there instead.", "warn"); return; }
+  confirmDialog(`Delete this credit record for <b>${escapeHtml(debt.customerName)}</b>? This cannot be undone.`, async ()=>{
+    await dataDelete("debts", debt.id);
+    state.debts = state.debts.filter(d=>d.id!==debt.id);
+    toast("Credit record deleted","ok"); drawCreditTab("debts");
+  });
+};
+// Admin-only: delete a standalone (not Sales-screen-linked) Advance
+// Payment record. Returns whatever reserved-but-uncollected stock it was
+// holding back to inventory, mirroring how deleting a linked sale already
+// restocks its Advance Payment — keeping the two paths consistent.
+window.deleteManualAdvance = function(id){
+  if(!can("editCreditRecords")){ toast("Only an Admin can delete an advance payment.", "err"); return; }
+  const adv = state.advances.find(a=>a.id===id);
+  if(!adv) return;
+  if(adv.saleId){ toast("This advance came from a Sales-screen transaction — delete the sale/receipt instead so stock is restored correctly.", "warn"); return; }
+  confirmDialog(`Delete this advance payment for <b>${escapeHtml(adv.customerName)}</b>? Any reserved-but-not-yet-collected stock will be returned to inventory. This cannot be undone.`, async ()=>{
+    for(const p of (adv.products||[])){
+      const outstanding = Math.max(0, (p.reserved||0) - (p.collected||0));
+      if(outstanding<=0) continue;
+      const product = state.products.find(x=>x.name===p.productName);
+      if(!product) continue;
+      const restore = stockDeductionFor(product, p.unit, outstanding);
+      product.currentStock = +(product.currentStock + restore).toFixed(4);
+      await dataSet("products", product);
+      await dataSet("stockHistory", { id:genId("stk"), productId:product.id, productName:product.name,
+        type:"Advance deleted (restock)", change:restore, reference:adv.receiptNumber, createdAt:Date.now(), by:state.user.name });
+    }
+    const linkedDebt = state.debts.find(d=>d.advanceId===adv.id);
+    if(linkedDebt){ await dataDelete("debts", linkedDebt.id); state.debts = state.debts.filter(d=>d.id!==linkedDebt.id); }
+    await dataDelete("advancePayments", adv.id);
+    state.advances = state.advances.filter(a=>a.id!==adv.id);
+    toast("Advance payment deleted — reserved stock restored.","ok"); drawCreditTab("advances");
+  });
 };
 window.viewAdvance = function(id){
   const adv = state.advances.find(a=>a.id===id);
@@ -2379,7 +2598,8 @@ window.viewAdvance = function(id){
     </div>
     ${owedForCollected>0.009 ? `<div class="pay-detail-note" style="background:var(--danger-light);color:var(--danger);border-radius:8px;padding:9px 12px;margin-bottom:14px">
       ⚠️ Customer has collected <b>${money(owedForCollected)}</b> worth of goods beyond what they've paid for. This has been automatically recorded as a debt in <b>Credit & Advance → Credit Sales (Debtors)</b>.</div>` : ""}
-    <div class="field"><label>Total Value of Goods (optional)</label><input type="number" id="advTotal" min="0" value="${adv.total!==null&&adv.total!==undefined?adv.total:''}" placeholder="Leave blank if unknown"></div>
+    <div class="field"><label>Total Value of Goods (optional)</label><input type="number" id="advTotal" min="0" value="${adv.total!==null&&adv.total!==undefined?adv.total:''}" placeholder="Leave blank if unknown" ${can("editCreditRecords")?"":"readonly style=\"background:var(--line)\""}>
+      ${can("editCreditRecords")?"":`<p style="font-size:11px;color:var(--ink-soft);margin-top:4px">🔒 Only an Admin can change the goods' total value.</p>`}</div>
     <div class="section-head" style="margin-top:10px"><h3 style="font-size:13.5px">Reserved Products</h3>
       <button class="btn btn-ghost btn-sm" id="advAddRow">+ Add product</button></div>
     <div id="advRows">${adv.products.map(rowHtml).join("")}</div>
@@ -2410,30 +2630,79 @@ window.viewAdvance = function(id){
   });
 
   document.getElementById("advSave").onclick = async ()=>{
-    const newProducts = [...rowsHost.children].map(row=>{
+    const priorProducts = adv.products; // snapshot for the stock reconciliation below
+    const seenIdx = new Set();
+    const mappedRows = [...rowsHost.children].map(row=>{
       const reserved = Math.max(0, +row.querySelector(".advResQty").value||0);
       const collectNow = Math.max(0, +row.querySelector(".advCollectNow").value||0);
       const existingIdx = +row.dataset.idx;
-      const priorCollected = existingIdx>=0 ? adv.products[existingIdx].collected : 0;
+      if(existingIdx>=0) seenIdx.add(existingIdx);
+      const priorCollected = existingIdx>=0 ? priorProducts[existingIdx].collected : 0;
       const collected = Math.min(reserved, priorCollected + collectNow);
       const productName = row.querySelector(".advProdSel").value;
       const unit = row.querySelector(".advUnitSel").value;
       // keep the price recorded when this product was originally reserved
       // (e.g. the actual sale price) unless the product/unit was changed,
       // in which case fall back to the current catalogue price
-      const prior = existingIdx>=0 ? adv.products[existingIdx] : null;
+      const prior = existingIdx>=0 ? priorProducts[existingIdx] : null;
       let unitPrice = (prior && prior.productName===productName && prior.unit===unit && prior.unitPrice!=null) ? prior.unitPrice : null;
       if(unitPrice==null){
         const product = state.products.find(x=>x.name===productName);
         unitPrice = product ? unitPriceFor(product, unit) : 0;
       }
-      return { productName, unit, reserved, collected, unitPrice };
-    }).filter(p=>p.reserved>0);
+      return { productName, unit, reserved, collected, unitPrice, __priorIdx: existingIdx };
+    });
+    const newProducts = mappedRows.filter(p=>p.reserved>0);
     if(!newProducts.length) return toast("Keep at least one reserved product","err");
-    adv.products = newProducts;
 
-    const totalInput = document.getElementById("advTotal").value;
-    adv.total = totalInput ? Math.max(0, +totalInput) : null;
+    // Reconcile physical stock against any change in reserved quantities.
+    // A Sales-screen Advance Payment already deducts stock the moment it's
+    // created; editing the reservation here (increasing/decreasing a
+    // quantity, or removing a product) must keep that in sync, otherwise
+    // stock counts would silently drift every time an advance is edited.
+    const stockOps = [];
+    for(const p of mappedRows){
+      const priorReserved = p.__priorIdx>=0 ? priorProducts[p.__priorIdx].reserved : 0;
+      const deltaQty = p.reserved - priorReserved; // >0 needs more stock reserved, <0 releases stock
+      if(Math.abs(deltaQty) < 1e-9) continue;
+      const product = state.products.find(x=>x.name===p.productName);
+      if(!product) continue;
+      const stockQty = stockDeductionFor(product, p.unit, Math.abs(deltaQty));
+      if(deltaQty>0 && stockQty > product.currentStock + 1e-9){
+        toast(`Not enough stock for ${product.name} to reserve the extra quantity. Available: ${fmtQty(product.currentStock)} ${product.stockUnit}`, "err");
+        return;
+      }
+      stockOps.push({ product, stockQty, sign: deltaQty>0 ? -1 : 1, type: deltaQty>0 ? "Advance reserved (extra)" : "Advance reservation reduced" });
+    }
+    // Rows removed entirely from the modal release whatever was still
+    // outstanding on them — the remove button is disabled once anything on
+    // that row has been collected, so the full reserved amount is always
+    // still physically held back and safe to return in one piece.
+    for(let i=0;i<priorProducts.length;i++){
+      if(seenIdx.has(i)) continue;
+      const p = priorProducts[i];
+      const outstanding = Math.max(0, (p.reserved||0)-(p.collected||0));
+      if(outstanding<=0) continue;
+      const product = state.products.find(x=>x.name===p.productName);
+      if(!product) continue;
+      stockOps.push({ product, stockQty: stockDeductionFor(product, p.unit, outstanding), sign:1, type:"Advance row removed (restock)" });
+    }
+    for(const op of stockOps){
+      op.product.currentStock = +(op.product.currentStock + op.sign*op.stockQty).toFixed(4);
+      await dataSet("products", op.product);
+      await dataSet("stockHistory", { id:genId("stk"), productId:op.product.id, productName:op.product.name,
+        type:op.type, change:op.sign*op.stockQty, reference:adv.receiptNumber, createdAt:Date.now(), by:state.user.name });
+    }
+
+    adv.products = newProducts.map(({__priorIdx, ...rest})=>rest);
+
+    // Only an Admin (editCreditRecords) may change the goods' total value —
+    // the input is also rendered read-only for anyone else, this is a
+    // defense-in-depth check against the stored value being altered.
+    if(can("editCreditRecords")){
+      const totalInput = document.getElementById("advTotal").value;
+      adv.total = totalInput ? Math.max(0, +totalInput) : null;
+    }
 
     const extra = Math.max(0, +document.getElementById("advExtraPay").value||0);
     if(extra>0){
@@ -2715,9 +2984,11 @@ window.viewCustomerHistory = function(id){
   const purchases = state.sales.filter(s=>s.customerId===id);
   const debts = state.debts.filter(d=>d.customerId===id);
   const advances = state.advances.filter(a=>a.customerId===id);
+  const storeCredit = customerStoreCredit(id);
   openModal(`<div class="modal-head"><h3>${escapeHtml(c.name)}</h3><button class="close-x" onclick="window.__closeModal()">✕</button></div>
   <div class="modal-body">
     <p style="font-size:13px;color:var(--ink-soft)">${escapeHtml(c.phone)} &middot; ${escapeHtml(c.address||"No address on file")}</p>
+    ${storeCredit>0.009 ? `<p style="font-size:13px;background:var(--ok-light);color:var(--ok);border-radius:8px;padding:8px 12px;margin-top:8px">🎟️ Store credit available: <b>${money(storeCredit)}</b> — can be applied at checkout on their next sale.</p>` : ""}
     <h4 style="font-size:13px;margin:14px 0 6px">Purchase History (${purchases.length})</h4>
     ${purchases.length? purchases.map(s=>`<div class="cart-line-sub" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
       <span>${fmtDate(s.createdAt)} — ${s.receiptNumber} — ${money(s.total)}</span>
@@ -2805,7 +3076,8 @@ function renderReports(){
         <select id="repType"><option value="sales">Sales</option><option value="profit">Profit</option>
           <option value="expense">Expense</option><option value="inventory">Inventory</option>
           <option value="customer">Customer</option><option value="debtors">Debtors</option>
-          <option value="advance">Advance Payments</option><option value="salesrep">Sales Rep</option></select>
+          <option value="advance">Advance Payments</option><option value="payments">Payments Ledger</option>
+          <option value="salesrep">Sales Rep</option></select>
         <button class="btn btn-ghost btn-sm" id="runReport">Run</button>
         <button class="btn btn-gold btn-sm" id="exportReport">Export CSV</button>
         <button class="btn btn-ghost btn-sm" id="printReport">🖨️ Print</button>
@@ -2853,11 +3125,18 @@ function runReport(){
     cols=["Customer","Phone","Purchases","Total Spent"];
     rows = state.customers.map(c=>{ const s=state.sales.filter(x=>x.customerId===c.id); return { Customer:c.name, Phone:c.phone, Purchases:s.length, "Total Spent":s.reduce((a,x)=>a+x.total,0) }; });
   } else if(type==="debtors"){
-    cols=["Customer","Phone","Receipt","Balance"];
-    rows = state.debts.filter(d=>d.balance>0).map(d=>({ Customer:d.customerName, Phone:d.phone, Receipt:d.receiptNumber, Balance:d.balance }));
+    cols=["Customer","Phone","Receipt","Total","Paid","Balance","Due Date","Status"];
+    rows = state.debts.filter(d=>d.balance>0 && inRange(d)).map(d=>({ Customer:d.customerName, Phone:d.phone, Receipt:d.receiptNumber,
+      Total:d.total, Paid:d.amountPaid, Balance:d.balance, "Due Date": d.dueDate ? fmtDate(new Date(d.dueDate).getTime()).split(",")[0] : "—",
+      Status: isDebtOverdue(d) ? "Overdue" : "Owing" }));
   } else if(type==="advance"){
     cols=["Customer","Receipt","Paid","Balance","Store Credit","Status"];
-    rows = state.advances.map(a=>({ Customer:a.customerName, Receipt:a.receiptNumber, Paid:a.amountPaid, Balance:a.balance, "Store Credit":a.creditBalance||0, Status:a.collectionStatus }));
+    rows = state.advances.filter(inRange).map(a=>({ Customer:a.customerName, Receipt:a.receiptNumber, Paid:a.amountPaid,
+      Balance: a.total===null||a.total===undefined?"Unknown":a.balance, "Store Credit":a.creditBalance||0, Status:a.collectionStatus }));
+  } else if(type==="payments"){
+    const data = (state.payments||[]).filter(inRange);
+    cols=["Type","Receipt","Method","Amount","By","Date"];
+    rows = data.map(p=>({ Type:p.type, Receipt:p.receiptNumber||"—", Method:p.method||"—", Amount:p.amount, By:p.by||"—", Date:fmtDate(p.createdAt) }));
   } else if(type==="salesrep"){
     const data = state.sales.filter(inRange);
     const byRep = {};
