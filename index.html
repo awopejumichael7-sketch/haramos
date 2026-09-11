@@ -2840,10 +2840,14 @@ window.viewAdvance = function(id){
     await syncAdvanceDebt(adv);
     const owedAfter = state.debts.find(d=>d.advanceId===adv.id)?.balance || 0;
     closeModal();
+    const restocked = stockOps.filter(op=>op.sign>0);
+    const restockMsg = restocked.length
+      ? ` Returned to stock: ${restocked.map(op=>`${fmtQty(op.stockQty)} ${op.product.stockUnit} ${op.product.name}`).join(", ")}.`
+      : "";
     if(owedAfter>0.009 && owedAfter!==owedBefore){
-      toast(`Advance payment updated — ${money(owedAfter)} owed for collected goods moved to Debtors`, "warn");
+      toast(`Advance payment updated — ${money(owedAfter)} owed for collected goods moved to Debtors.${restockMsg}`, "warn");
     } else {
-      toast("Advance payment updated","ok");
+      toast(`Advance payment updated.${restockMsg}`, "ok");
     }
     drawCreditTab("advances");
   };
