@@ -2419,9 +2419,13 @@ window.openManualAdvanceModal = function(){
     prodSel.addEventListener("change", fillUnits);
     unitSel.addEventListener("change", ()=>updateRowTotal(row));
     qtyInput.addEventListener("input", ()=>updateRowTotal(row));
-    fillUnits();
     row.querySelector(".remRow").onclick = ()=>{ row.remove(); updateGrandTotal(); };
+    // The row must be attached to the DOM before its price/total is first
+    // computed — updateGrandTotal() only sums rows already inside the
+    // container, so filling the row in beforehand made the very first
+    // product added always show a ₦0.00 running total.
     rows.appendChild(row);
+    fillUnits();
   };
   addRow();
   document.getElementById("maAddRow").addEventListener("click", addRow);
