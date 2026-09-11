@@ -1912,6 +1912,13 @@ function buildReceiptHTML(sale, layout){
   const balanceLine = sale.balance>0 ? `<div class="r-row"><b>BALANCE OWING</b><b>${money(sale.balance)}</b></div>` : "";
   const breakdownLines = sale.paymentBreakdown ? sale.paymentBreakdown.map(l=>
     `<div class="r-row"><span>&nbsp;&nbsp;${escapeHtml(l.method)}</span><span>${money(l.amount)}</span></div>`).join("") : "";
+  // Store credit redeemed on this transaction (set at checkout when the
+  // customer had credit available) and, separately, whatever store credit
+  // they still have left after this transaction — shown whenever either is
+  // non-zero so the customer always sees where they stand.
+  const creditAppliedLine = sale.creditApplied>0.009 ? `<div class="r-row"><span>Store Credit Applied</span><span>-${money(sale.creditApplied)}</span></div>` : "";
+  const storeCreditRemaining = sale.customerId ? customerStoreCredit(sale.customerId) : (sale.creditBalance||0);
+  const storeCreditLine = storeCreditRemaining>0.009 ? `<div class="r-row" style="font-weight:600"><span>Store Credit Balance</span><span>${money(storeCreditRemaining)}</span></div>` : "";
   return `
   <div class="receipt ${layout}" id="receiptRoot">
     <div class="r-center"><b style="font-size:15px">${escapeHtml(s.name||"HARAMOS ENTERPRISE")}</b><br>${escapeHtml(s.phone||"")}<br>${escapeHtml(s.address||"")}</div>
@@ -1930,6 +1937,7 @@ function buildReceiptHTML(sale, layout){
     <div class="r-row"><span>Tax</span><span>${money(sale.tax)}</span></div>
     <div class="r-row" style="font-weight:700;font-size:1.1em"><span>TOTAL</span><span>${money(sale.total)}</span></div>
     <div class="r-row"><span>Paid</span><span>${money(sale.amountPaid)}</span></div>
+    ${creditAppliedLine}
     ${balanceLine}
     <div class="r-row"><span>Payment</span><span>${escapeHtml(sale.paymentMethod)}</span></div>
     ${breakdownLines}
@@ -1938,7 +1946,10 @@ function buildReceiptHTML(sale, layout){
     <table><thead><tr><th>Product</th><th style="text-align:right">Collected</th><th style="text-align:right">Remaining</th></tr></thead>
     <tbody>${sale.advanceProducts.map(p=>`<tr><td>${escapeHtml(p.productName)}</td><td style="text-align:right">${fmtQty(p.collected)} ${escapeHtml(p.unit)}</td><td style="text-align:right">${fmtQty(p.reserved-p.collected)} ${escapeHtml(p.unit)}</td></tr>`).join("")}</tbody></table>
     <div class="r-row"><span>Total Products Collected</span><span>${fmtQty(sale.advanceProducts.reduce((a,p)=>a+p.collected,0))}</span></div>
-    <div class="r-row"><span>Total Products Remaining</span><span>${fmtQty(sale.advanceProducts.reduce((a,p)=>a+(p.reserved-p.collected),0))}</span></div>` : ""}
+    <div class="r-row"><span>Total Products Remaining</span><span>${fmtQty(sale.advanceProducts.reduce((a,p)=>a+(p.reserved-p.collected),0))}</span></div>
+    <div class="r-row" style="font-weight:600"><span>Value of Goods Collected</span><span>${money(sale.advanceProducts.reduce((a,p)=>a+p.collected*(p.unitPrice||0),0))}</span></div>
+    <div class="r-row"><span>Value of Goods Remaining</span><span>${money(sale.advanceProducts.reduce((a,p)=>a+(p.reserved-p.collected)*(p.unitPrice||0),0))}</span></div>` : ""}
+    ${storeCreditLine ? `<hr>${storeCreditLine}` : ""}
     <hr>
     <div class="r-center" id="rcBarcode"></div>
     <div class="r-center" id="rcQr" style="margin-top:6px"></div>
@@ -2055,7 +2066,7 @@ function buildDebtReceiptSale(d){
   const original = d.saleId && state.sales.find(s=>s.id===d.saleId);
   const base = original ? { ...original } : {
     receiptNumber: d.receiptNumber, createdAt: d.createdAt,
-    cashierName: state.user?.name || "Store", customerName: d.customerName,
+    cashierName: state.user?.name || "Store", customerName: d.customerName, customerId: d.customerId,
     items: [{ productName: d.notes ? `Credit / Debt — ${d.notes}` : "Credit / Debt balance", unit:"", qtySold:1, unitPrice:d.total, unitCost:0 }],
     subtotal: d.total, discount:0, taxPct:0, tax:0, total: d.total,
     paymentMethod:"Credit", paymentBreakdown:null
@@ -2067,7 +2078,7 @@ function buildDebtReceiptSale(d){
    not have been recorded) when there's no linked sale. */
 function buildAdvanceReceiptSale(a){
   const original = a.saleId && state.sales.find(s=>s.id===a.saleId);
-  if(original) return Object.assign({}, original, { amountPaid:a.amountPaid, balance:a.balance, advanceProducts:a.products||[] });
+  if(original) return Object.assign({}, original, { amountPaid:a.amountPaid, balance:a.balance, advanceProducts:a.products||[], creditBalance:a.creditBalance||0 });
   const total = a.total!=null ? a.total : a.amountPaid;
   const qtyTotal = (a.products||[]).reduce((sum,p)=>sum+p.reserved,0) || 1;
   const items = (a.products && a.products.length) ? a.products.map(p=>({
@@ -2075,9 +2086,9 @@ function buildAdvanceReceiptSale(a){
     unit:p.unit, qtySold:p.reserved, unitPrice: +(total*(p.reserved/qtyTotal)/p.reserved || 0).toFixed(2), unitCost:0
   })) : [{ productName:"Advance payment", unit:"", qtySold:1, unitPrice:a.amountPaid, unitCost:0 }];
   return { receiptNumber:a.receiptNumber, createdAt:a.createdAt, cashierName: state.user?.name||"Store",
-    customerName:a.customerName, items, subtotal:total, discount:0, taxPct:0, tax:0, total,
+    customerName:a.customerName, customerId:a.customerId, items, subtotal:total, discount:0, taxPct:0, tax:0, total,
     amountPaid:a.amountPaid, balance:a.balance, paymentMethod:"Advance Payment", paymentBreakdown:null,
-    advanceProducts: a.products||[] };
+    advanceProducts: a.products||[], creditBalance:a.creditBalance||0 };
 }
 window.viewDebtReceipt = function(id){
   const d = state.debts.find(x=>x.id===id); if(!d) return;
@@ -2096,7 +2107,7 @@ function enrichSaleWithAdvance(sale){
   const adv = state.advances.find(a=>a.saleId===sale.id);
   if(!adv) return sale;
   return Object.assign({}, sale, { amountPaid:adv.amountPaid, balance:adv.balance,
-    advanceProducts:adv.products||[], collectionStatus:adv.collectionStatus });
+    advanceProducts:adv.products||[], collectionStatus:adv.collectionStatus, creditBalance:adv.creditBalance||0 });
 }
 /* Same idea for Credit/Debt sales — a sale paid on credit gets a linked
    `debts` record that keeps its own running amountPaid/balance/history as
@@ -2616,7 +2627,7 @@ window.viewAdvance = function(id){
     const units = product ? sellableUnits(product) : [{unit:p.unit}];
     const unitPrice = rowUnitPrice(p.productName, p.unit, idx);
     return `<div class="adv-prod-row" data-idx="${idx}" style="display:flex;gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap">
-      <select class="advProdSel" style="flex:2;min-width:140px;padding:7px;border-radius:8px;border:1px solid var(--line)">
+      <select class="advProdSel" title="${p.collected>0?'Cannot change product — already partially collected':''}" ${p.collected>0?"disabled":""} style="flex:2;min-width:140px;padding:7px;border-radius:8px;border:1px solid var(--line)">
         ${state.products.map(pr=>`<option value="${escapeHtml(pr.name)}" ${pr.name===p.productName?"selected":""}>${escapeHtml(pr.name)}</option>`).join("")}
       </select>
       <input class="advResQty" type="number" min="${p.collected}" step="0.01" value="${p.reserved}" title="Reserved qty" style="width:80px;padding:7px;border-radius:8px;border:1px solid var(--line)">
@@ -2725,11 +2736,38 @@ window.viewAdvance = function(id){
     // Reconcile physical stock against any change in reserved quantities.
     // A Sales-screen Advance Payment already deducts stock the moment it's
     // created; editing the reservation here (increasing/decreasing a
-    // quantity, or removing a product) must keep that in sync, otherwise
-    // stock counts would silently drift every time an advance is edited.
+    // quantity, removing a product, or swapping a row to a different
+    // product) must keep that in sync, otherwise stock counts would
+    // silently drift every time an advance is edited.
     const stockOps = [];
     for(const p of mappedRows){
-      const priorReserved = p.__priorIdx>=0 ? priorProducts[p.__priorIdx].reserved : 0;
+      const prior = p.__priorIdx>=0 ? priorProducts[p.__priorIdx] : null;
+      if(prior && prior.productName!==p.productName){
+        // The row was switched to a different product entirely — this is
+        // not a quantity change on the same item, so diffing the two
+        // quantities against each other would be meaningless. Treat it as
+        // fully releasing the old product's reservation and separately
+        // reserving the newly-selected product, exactly like deleting the
+        // old row and adding a fresh one.
+        const oldOutstanding = Math.max(0, (prior.reserved||0) - (prior.collected||0));
+        if(oldOutstanding>0){
+          const oldProduct = state.products.find(x=>x.name===prior.productName);
+          if(oldProduct) stockOps.push({ product:oldProduct, stockQty: stockDeductionFor(oldProduct, prior.unit, oldOutstanding), sign:1, type:"Advance row changed (restock old product)" });
+        }
+        if(p.reserved>0){
+          const newProduct = state.products.find(x=>x.name===p.productName);
+          if(newProduct){
+            const stockQty = stockDeductionFor(newProduct, p.unit, p.reserved);
+            if(stockQty > newProduct.currentStock + 1e-9){
+              toast(`Not enough stock for ${newProduct.name}. Available: ${fmtQty(newProduct.currentStock)} ${newProduct.stockUnit}`, "err");
+              return;
+            }
+            stockOps.push({ product:newProduct, stockQty, sign:-1, type:"Advance row changed (reserve new product)" });
+          }
+        }
+        continue;
+      }
+      const priorReserved = prior ? prior.reserved : 0;
       const deltaQty = p.reserved - priorReserved; // >0 needs more stock reserved, <0 releases stock
       if(Math.abs(deltaQty) < 1e-9) continue;
       const product = state.products.find(x=>x.name===p.productName);
