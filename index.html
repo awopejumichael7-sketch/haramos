@@ -2617,6 +2617,7 @@ window.viewAdvance = function(id){
   if(!adv.creditBalance) adv.creditBalance = 0;
   const owedForCollected = Math.max(0, +(advCollectedValue(adv)-adv.amountPaid).toFixed(2));
   const isManual = !adv.saleId;
+  const originalTotal = adv.total; // snapshot at open time — see advSave below
   // Same "keep the price it was originally reserved at" rule used when
   // saving (advSave below) — reused here so the live price/line-total
   // shown while editing always matches what will actually be recorded.
@@ -2661,7 +2662,7 @@ window.viewAdvance = function(id){
     ${isManual
       ? `<p style="font-size:11px;color:var(--ink-soft);margin-top:4px">Calculated automatically from each product's exact price × quantity above.</p>`
       : `<div class="field" style="margin-top:8px"><label>Actual Sale Total (used for balance/credit)</label><input type="number" id="advTotal" min="0" value="${adv.total!==null&&adv.total!==undefined?adv.total:''}" placeholder="Leave blank if unknown" ${can("editCreditRecords")?"":"readonly style=\"background:var(--line)\""}>
-      <p style="font-size:11px;color:var(--ink-soft);margin-top:4px">${can("editCreditRecords")?"This came from the original sale and may include a discount or tax, so it can differ from the list-price value above.":"🔒 Only an Admin can change the goods' total value."}</p></div>`}
+      <p style="font-size:11px;color:var(--ink-soft);margin-top:4px">${can("editCreditRecords")?"This came from the original sale and may include a discount or tax, so it can differ from the list-price value above. It updates automatically to reflect any product you add, remove, or resize — type an exact figure here only if you need to override that.":"🔒 Only an Admin can type an exact override here — it still updates automatically to reflect any product you add, remove, or resize."}</p></div>`}
     <p style="font-size:11.5px;color:var(--ink-soft);margin-top:4px">If a customer collects more product value than they've paid for, the shortfall is automatically moved into the Credit & Advance debtors ledger when you hit Save.</p>
     <div class="field" style="margin-top:12px"><label>Additional Payment Now (optional)</label><input type="number" id="advExtraPay" min="0" value="0">
       <p style="font-size:11.5px;color:var(--ink-soft);margin-top:4px">You can pay more than the outstanding balance — any excess is added to Store Credit.</p></div>
@@ -2808,14 +2809,32 @@ window.viewAdvance = function(id){
     // For manual advances, the Total Value is never typed — it's always
     // the exact sum of each reserved product's price × quantity, matching
     // the live figure shown in the modal above. For advances that came
-    // from an actual sale (which may include a discount/tax the unit
-    // prices alone can't reconstruct), the real sale total is preserved
-    // and only an Admin may override it.
+    // from an actual sale, the original discount/tax-adjusted total is
+    // preserved, but it must still track any real change in the reserved
+    // goods — otherwise adding, removing, or resizing a product here would
+    // silently leave the sale total (and therefore balance/credit) out of
+    // sync with what's actually reserved, as happened before this fix.
     if(isManual){
       adv.total = +(adv.products.reduce((sum,p)=>sum + p.unitPrice*p.reserved, 0).toFixed(2));
-    } else if(can("editCreditRecords")){
-      const totalInput = document.getElementById("advTotal").value;
-      adv.total = totalInput ? Math.max(0, +totalInput) : null;
+    } else {
+      const priorGoodsValue = priorProducts.reduce((sum,p)=>sum+(p.unitPrice||0)*(p.reserved||0), 0);
+      const newGoodsValue = adv.products.reduce((sum,p)=>sum+(p.unitPrice||0)*(p.reserved||0), 0);
+      const goodsDelta = +(newGoodsValue-priorGoodsValue).toFixed(2);
+      let adminOverrode = false;
+      if(can("editCreditRecords")){
+        const totalInput = document.getElementById("advTotal").value;
+        const typedVal = totalInput ? Math.max(0, +totalInput) : null;
+        if(typedVal !== originalTotal){
+          // The Admin actively retyped the figure — trust it exactly as
+          // entered, since only they can know the real discount/tax.
+          adv.total = typedVal;
+          adminOverrode = true;
+        }
+      }
+      if(!adminOverrode){
+        if(originalTotal!=null) adv.total = +(originalTotal + goodsDelta).toFixed(2);
+        else if(Math.abs(goodsDelta)>0.009) adv.total = +newGoodsValue.toFixed(2);
+      }
     }
 
     const extra = Math.max(0, +document.getElementById("advExtraPay").value||0);
