@@ -2170,8 +2170,10 @@ function buildReceiptHTML(sale, layout){
     const product = state.products.find(p=>p.id===i.productId);
     const equiv = (product && i.unit!==product.stockUnit && i.qtyInStockUnit!=null)
       ? `<div style="font-size:9.5px;opacity:.75">= ${fmtQty(i.qtyInStockUnit)} ${escapeHtml(product.stockUnit)}</div>` : "";
+    const returnedQty = returnedQtyFor(sale, i.productName, i.unit);
+    const returnedNote = returnedQty>0.009 ? `<tr><td colspan="4" style="font-size:.85em;color:#b3261e;padding-top:0">↩ Returned ${fmtQty(returnedQty)} ${escapeHtml(i.unit)} — net kept ${fmtQty(i.qtySold-returnedQty)} ${escapeHtml(i.unit)}</td></tr>` : "";
     return `<tr><td>${escapeHtml(i.productName)}</td><td>${fmtQty(i.qtySold)} ${escapeHtml(i.unit)}${equiv}</td>
-    <td style="text-align:right">${money(i.unitPrice)}</td><td style="text-align:right">${money(i.qtySold*i.unitPrice)}</td></tr>`;
+    <td style="text-align:right">${money(i.unitPrice)}</td><td style="text-align:right">${money(i.qtySold*i.unitPrice)}</td></tr>${returnedNote}`;
   }).join("");
   const balanceLine = sale.balance>0 ? `<div class="r-row"><b>BALANCE OWING</b><b>${money(sale.balance)}</b></div>` : "";
   const breakdownLines = sale.paymentBreakdown ? sale.paymentBreakdown.map(l=>
@@ -2213,6 +2215,7 @@ function buildReceiptHTML(sale, layout){
     <div class="r-row"><span>Total Products Remaining</span><span>${fmtQty(sale.advanceProducts.reduce((a,p)=>a+(p.reserved-p.collected),0))}</span></div>
     <div class="r-row" style="font-weight:600"><span>Value of Goods Collected</span><span>${money(sale.advanceProducts.reduce((a,p)=>a+p.collected*(p.unitPrice||0),0))}</span></div>
     <div class="r-row"><span>Value of Goods Remaining</span><span>${money(sale.advanceProducts.reduce((a,p)=>a+(p.reserved-p.collected)*(p.unitPrice||0),0))}</span></div>` : ""}
+    ${returnsReceiptBlockHTML(sale)}
     ${storeCreditLine ? `<hr>${storeCreditLine}` : ""}
     <hr>
     <div class="r-center" id="rcBarcode"></div>
@@ -2269,7 +2272,8 @@ function downloadReceiptPDF(sale){
   try{
     const { jsPDF } = window.jspdf;
     const extraHeight = sale.advanceProducts && sale.advanceProducts.length ? 40+sale.advanceProducts.length*24 : 0;
-    const pdf = new jsPDF({ unit:"pt", format:[227, 500+sale.items.length*30+extraHeight] });
+    const returnsHeight = returnsReceiptPdfHeight(sale);
+    const pdf = new jsPDF({ unit:"pt", format:[227, 500+sale.items.length*30+extraHeight+returnsHeight] });
     let y = 26;
     const s = state.settings;
     pdf.setFont("courier","bold"); pdf.setFontSize(12);
@@ -2288,6 +2292,12 @@ function downloadReceiptPDF(sale){
         pdf.setFontSize(8);
         pdf.text(`  = ${fmtQty(i.qtyInStockUnit)} ${product.stockUnit}`, 14, y); y+=11;
         pdf.setFontSize(9);
+      }
+      const returnedQty = returnedQtyFor(sale, i.productName, i.unit);
+      if(returnedQty>0.009){
+        pdf.setFontSize(8); pdf.setTextColor(150,40,35);
+        pdf.text(`  Returned ${fmtQty(returnedQty)} ${i.unit} (net kept ${fmtQty(i.qtySold-returnedQty)})`, 14, y); y+=11;
+        pdf.setTextColor(0,0,0); pdf.setFontSize(9);
       }
     });
     y+=4;
@@ -2312,6 +2322,7 @@ function downloadReceiptPDF(sale){
       pdf.text(`Total Collected: ${fmtQty(totalCollected)}`, 14, y); y+=12;
       pdf.text(`Total Remaining: ${fmtQty(totalRemaining)}`, 14, y); y+=12;
     }
+    y = drawReturnsPdfSection(pdf, sale, y);
     y+=10;
     pdf.text(s.footer||"Thank you for shopping with us!", 113, y, {align:"center"});
     pdf.save(`${sale.receiptNumber}.pdf`);
@@ -2356,17 +2367,141 @@ function buildAdvanceReceiptSale(a){
 }
 window.viewDebtReceipt = function(id){
   const d = state.debts.find(x=>x.id===id); if(!d) return;
-  showReceiptModal(buildDebtReceiptSale(d));
+  showReceiptModal(enrichSaleWithReturns(buildDebtReceiptSale(d)));
 };
 window.viewAdvanceReceipt = function(id){
   const a = state.advances.find(x=>x.id===id); if(!a) return;
-  showReceiptModal(buildAdvanceReceiptSale(a));
+  showReceiptModal(enrichSaleWithReturns(buildAdvanceReceiptSale(a)));
 };
 /* Given a plain sales-history record, look up whether it has a linked
    Advance Payment record and, if so, overlay that record's live
    amountPaid/balance/collection-progress onto the receipt — so the
    Sales History receipt always reflects the current collection state,
    not just a snapshot from the moment of the original transaction. */
+/* ------------------------------------------------------------------
+   19C. RETURNS ON THE RECEIPT
+
+   WHY THIS EXISTS
+   Processing a return (section 17/"Process Return") already restocks
+   goods and settles the refund — but the original sale's receipt never
+   showed that a return had happened. This section closes that gap by
+   overlaying the CURRENT list of returns for a sale onto its receipt,
+   using the exact same live-overlay pattern already established by
+   enrichSaleWithDebt/enrichSaleWithAdvance: nothing about the original
+   sale record is changed, the receipt just reads state.returns fresh
+   every time it is built. That is also what makes it keep updating —
+   every reprint (from Sales History, Receipt History, a debt receipt,
+   or an advance receipt) re-reads state.returns at that moment, so a
+   second or third return against the same sale shows up automatically
+   the next time the receipt is opened, with no extra step required.
+
+   ACCURACY
+   The original Subtotal/Discount/Tax/Total/Paid/Balance lines are left
+   completely untouched — they remain the exact historical record of
+   the transaction as it happened. Everything here is additive: a
+   returned-quantity note under the affected item line, and a dedicated
+   RETURNS section with a running "Net Total (after returns)" figure.
+   Every figure is sourced directly from the same `returns` records the
+   existing Process Return flow already writes — refund totals are
+   never recalculated or guessed, only summed and grouped by the refund
+   method actually chosen at the time, so the receipt can never disagree
+   with the Returns page or the Debtors/Customer-Accounts figures.
+------------------------------------------------------------------ */
+function saleReturnsFor(saleId){
+  if(!saleId) return [];
+  return state.returns.filter(r=>r.saleId===saleId).sort((a,b)=>a.createdAt-b.createdAt);
+}
+/* How much of one specific line item has been returned so far, summed
+   across every return event on this sale — matches the same productName
+   + unit key that the existing Process Return modal itself matches on
+   (see alreadyReturnedQty), so the two can never disagree. */
+function returnedQtyFor(sale, productName, unit){
+  if(!sale.returnedByKey) return 0;
+  return sale.returnedByKey[productName+"||"+unit] || 0;
+}
+/* Overlays the sale's returns onto a receipt-ready object. A no-op
+   (returns the same object) when the sale has no id or no returns yet,
+   so it is always safe to wrap any sale-like object with this. */
+function enrichSaleWithReturns(sale){
+  const returns = saleReturnsFor(sale.id);
+  if(!returns.length) return sale;
+  const returnedByKey = {};
+  returns.forEach(r=> r.items.forEach(i=>{
+    const k = i.productName+"||"+i.unit;
+    returnedByKey[k] = +((returnedByKey[k]||0) + i.qty).toFixed(4);
+  }));
+  const sumBy = method => +returns.filter(r=>r.refundMethod===method).reduce((a,r)=>a+(r.totalRefund||0),0).toFixed(2);
+  const totalReturnedValue = +returns.reduce((a,r)=>a+(r.totalRefund||0),0).toFixed(2);
+  return Object.assign({}, sale, {
+    returnsList: returns,
+    returnedByKey,
+    totalReturnedValue,
+    netTotal: +((sale.total||0) - totalReturnedValue).toFixed(2),
+    cashRefunded: sumBy("Cash"),
+    creditIssued: sumBy("Store Credit"),
+    appliedToBalance: sumBy("Reduce Balance")
+  });
+}
+/* The RETURNS section of the on-screen / printed receipt (thermal and
+   A4 share this — same markup, the surrounding .receipt.wA4/.w80/.w58
+   class already handles the width/font differences). Renders to "" when
+   there is nothing to show, so it is invisible on every receipt that has
+   no returns. */
+function returnsReceiptBlockHTML(sale){
+  if(!sale.returnsList || !sale.returnsList.length) return "";
+  const rows = sale.returnsList.map(r=>{
+    const items = r.items.map(i=>`${fmtQty(i.qty)} ${escapeHtml(i.unit)} ${escapeHtml(i.productName)} (${money(i.refundAmount)})`).join(", ");
+    return `<div class="r-row" style="align-items:flex-start;gap:10px">
+      <span>${fmtDate(r.createdAt)}<div style="font-size:.86em;opacity:.85">${items}${r.reason?` — <i>${escapeHtml(r.reason)}</i>`:""}</div></span>
+      <span style="white-space:nowrap;font-weight:600">-${money(r.totalRefund)}</span></div>`;
+  }).join("");
+  const line = (label,val) => val>0.009 ? `<div class="r-row"><span>${label}</span><span>-${money(val)}</span></div>` : "";
+  return `<hr><div class="r-center" style="font-weight:700">RETURNS</div>
+    ${rows}
+    <div class="r-row" style="font-weight:600;border-top:1px dashed #999;margin-top:4px;padding-top:4px"><span>Total Returned</span><span>-${money(sale.totalReturnedValue)}</span></div>
+    <div class="r-row" style="font-weight:700;font-size:1.05em"><span>NET TOTAL (after returns)</span><span>${money(sale.netTotal)}</span></div>
+    ${line("Refunded to Customer (Cash)", sale.cashRefunded)}
+    ${line("Store Credit Issued", sale.creditIssued)}
+    ${line("Applied to Outstanding Balance", sale.appliedToBalance)}`;
+}
+/* Extra vertical space the PDF's fixed-height page needs to fit the
+   RETURNS section, computed up front since jsPDF needs the page height
+   before anything is drawn (mirrors how advanceProducts already does
+   this via `extraHeight` in downloadReceiptPDF — same idea, new block). */
+function returnsReceiptPdfHeight(sale){
+  if(!sale.returnsList || !sale.returnsList.length) return 0;
+  const itemLines = sale.returnsList.reduce((a,r)=>a + 1 + (r.reason?1:0), 0); // date+items line, +1 if a reason is shown
+  return 40 + itemLines*13 + 60; // heading + per-return lines + summary lines
+}
+/* Draws the RETURNS section into an in-progress receipt PDF at the given
+   y and returns the new y — called from downloadReceiptPDF right after
+   the existing Collection Status block, before the footer. Restores the
+   font/colour it started with so nothing after it is affected. */
+function drawReturnsPdfSection(pdf, sale, y){
+  if(!sale.returnsList || !sale.returnsList.length) return y;
+  y += 6;
+  pdf.setFont("courier","bold"); pdf.setFontSize(9); pdf.setTextColor(0,0,0);
+  pdf.text("RETURNS", 113, y, {align:"center"}); y += 13;
+  pdf.setFont("courier","normal");
+  sale.returnsList.forEach(r=>{
+    pdf.setTextColor(0,0,0);
+    pdf.text(fmtDate(r.createdAt), 14, y); y += 11;
+    pdf.setTextColor(150,40,35);
+    const items = r.items.map(i=>`${fmtQty(i.qty)} ${i.unit} ${i.productName}`).join(", ");
+    pdf.text(pdf.splitTextToSize(`  ${items}`, 199), 14, y); y += 11;
+    pdf.setTextColor(0,0,0);
+    pdf.text("Refund", 14, y); pdf.text(`-${money(r.totalRefund)}`, 213, y, {align:"right"}); y += 12;
+    if(r.reason){ pdf.setFontSize(8); pdf.text(pdf.splitTextToSize(`  Reason: ${r.reason}`,199), 14, y); y += 11; pdf.setFontSize(9); }
+  });
+  pdf.setFont("courier","bold");
+  pdf.text("Total Returned", 14, y); pdf.text(`-${money(sale.totalReturnedValue)}`, 213, y, {align:"right"}); y += 13;
+  pdf.text("NET TOTAL", 14, y); pdf.text(money(sale.netTotal), 213, y, {align:"right"}); y += 14;
+  pdf.setFont("courier","normal");
+  [["Refunded to Customer (Cash)", sale.cashRefunded], ["Store Credit Issued", sale.creditIssued], ["Applied to Outstanding Balance", sale.appliedToBalance]]
+    .forEach(([lbl,val])=>{ if(val>0.009){ pdf.text(lbl, 14, y); pdf.text(`-${money(val)}`, 213, y, {align:"right"}); y += 12; } });
+  return y + 4;
+}
+
 function enrichSaleWithAdvance(sale){
   const adv = state.advances.find(a=>a.saleId===sale.id);
   if(!adv) return sale;
@@ -2389,7 +2524,7 @@ function enrichSaleWithDebt(sale){
 /* Convenience wrapper: apply whichever overlay (debt or advance) applies
    to this sale — a given sale can only ever have one of the two linked. */
 function enrichSale(sale){
-  return enrichSaleWithDebt(enrichSaleWithAdvance(sale));
+  return enrichSaleWithReturns(enrichSaleWithDebt(enrichSaleWithAdvance(sale)));
 }
 function renderReceipts(){
   const html = `
