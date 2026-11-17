@@ -2,7 +2,7 @@
 // Purpose: make the app installable and usable offline.
 // It does NOT touch your data (that all lives in IndexedDB, untouched).
 
-const CACHE_NAME = "excellence-store-pos-v6";
+const CACHE_NAME = "excellence-store-pos-v9";
 // Everything (manifest, icons) is now embedded inside index.html itself,
 // so the app shell is just the one file plus its own root URL.
 const CORE_ASSETS = [
@@ -59,6 +59,9 @@ self.addEventListener("fetch", (event) => {
           if (req.mode === "navigate") {
             return caches.match("./index.html");
           }
+          // Not cached and offline (e.g. a CDN script): answer with a clean network error
+          // instead of undefined, which made the browser throw respondWith errors.
+          return Response.error();
         });
     })
   );
