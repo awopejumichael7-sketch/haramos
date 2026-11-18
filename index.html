@@ -1763,6 +1763,140 @@ function customerDebit(customer){
     .filter(d=> d.customerId ? d.customerId===customer.id : String(d.customerName||"").trim().toLowerCase()===nm)
     .reduce((sum,d)=>sum+Math.max(0,+d.balance||0),0));
 }
+// Open (unpaid) debts of a customer, oldest first — same matching rule as customerDebit().
+function customerOpenDebts(customer){
+  if(!customer) return [];
+  const nm = String(customer.name||"").trim().toLowerCase();
+  return state.debts
+    .filter(d=> (d.customerId ? d.customerId===customer.id : String(d.customerName||"").trim().toLowerCase()===nm) && (+d.balance||0) > 0.009)
+    .sort((a,b)=>(a.createdAt||0)-(b.createdAt||0));
+}
+// Push a debt's current progress back onto the sale it came from, so Receipt History always reflects the real balance.
+async function pushDebtToLinkedSale(debt){
+  if(!debt.saleId) return;
+  const linkedSale = state.sales.find(s=>s.id===debt.saleId);
+  if(!linkedSale) return;
+  linkedSale.amountPaid = debt.amountPaid;
+  linkedSale.balance = debt.balance;
+  linkedSale.status = debt.balance<=0.009 ? "Paid" : "Partial/Owing";
+  await dataSet("sales", linkedSale);
+  await dataSet("receipts", { id:linkedSale.id, ...linkedSale });
+  const rxIdx = state.receipts.findIndex(r=>r.id===linkedSale.id);
+  if(rxIdx>-1) state.receipts[rxIdx] = { id:linkedSale.id, ...linkedSale };
+}
+// Apply a payment to one debt (no ledger entry — callers decide how the money is recorded).
+// A debt that mirrors an Advance Payment shortfall is settled by crediting the payment onto the advance itself and
+// re-deriving the balance from it; decrementing debt.balance as well would count the same payment twice.
+async function applyDebtPayment(debt, amt, method, ref){
+  debt.history = debt.history || [];
+  const entry = { amount:amt, date:Date.now(), method, by:state.user.name };
+  if(ref) entry.ref = ref;
+  if(debt.advanceId){
+    debt.history.push(entry);
+    const adv = state.advances.find(a=>a.id===debt.advanceId);
+    if(adv){
+      adv.amountPaid = r2(adv.amountPaid + amt);
+      await dataSet("advancePayments", adv);
+      await syncAdvanceDebt(adv);
+    } else {
+      debt.amountPaid = r2(debt.amountPaid + amt); debt.balance = r2(debt.balance - amt);
+      await dataSet("debts", debt);
+    }
+  } else {
+    debt.amountPaid = r2(debt.amountPaid + amt); debt.balance = r2(debt.balance - amt);
+    debt.history.push(entry);
+    await dataSet("debts", debt);
+  }
+  await pushDebtToLinkedSale(debt);
+}
+// Exact reverse of applyDebtPayment (used when a receipt that cleared debts is deleted).
+async function unapplyDebtPayment(debt, amt, ref){
+  debt.history = debt.history || [];
+  const i = debt.history.findIndex(h=>h.ref===ref && Math.abs((+h.amount||0)-amt)<0.01);
+  if(i>=0) debt.history.splice(i,1);
+  if(debt.advanceId){
+    const adv = state.advances.find(a=>a.id===debt.advanceId);
+    if(adv){
+      adv.amountPaid = r2(Math.max(0, adv.amountPaid - amt));
+      await dataSet("advancePayments", adv);
+      await syncAdvanceDebt(adv);
+      return;
+    }
+  }
+  debt.amountPaid = r2(Math.max(0, debt.amountPaid - amt)); debt.balance = r2(debt.balance + amt);
+  await dataSet("debts", debt);
+  await pushDebtToLinkedSale(debt);
+}
+// A customer paid MORE than the sale needed. The extra goes (1) to their oldest unpaid debts first, then
+// (2) whatever is left becomes store credit (an Advance record) — so it appears in their account automatically.
+async function allocateExcess(customer, amount, method, sale){
+  let remaining = r2(amount), toDebt = 0, toCredit = 0;
+  const allocations = [];
+  for(const debt of customerOpenDebts(customer)){
+    if(remaining <= 0.009) break;
+    const pay = r2(Math.min(debt.balance, remaining));
+    if(pay <= 0.009) continue;
+    await applyDebtPayment(debt, pay, method, sale.receiptNumber);
+    allocations.push({ debtId:debt.id, receiptNumber:debt.receiptNumber, amount:pay });
+    toDebt = r2(toDebt + pay); remaining = r2(remaining - pay);
+  }
+  if(remaining > 0.009){
+    const adv = { id:genId("adv"), customerId:customer.id, customerName:customer.name, phone:customer.phone||"", saleId:null,
+      receiptNumber:"ADV-"+Date.now().toString().slice(-8), amountPaid:remaining, total:0, balance:0, creditBalance:remaining,
+      products:[], collectionStatus:"Fully Collected", isDeposit:true, excessOf:sale.id,
+      notes:`Excess payment on receipt ${sale.receiptNumber}`, createdBy:state.user.name, createdAt:Date.now() };
+    await dataSet("advancePayments", adv); state.advances.push(adv);
+    toCredit = remaining;
+  }
+  return { toDebt, toCredit, allocations };
+}
+// Live "what happens to the money" box under the payment method (amount received vs amount due).
+let excessModePref = "account";
+function updatePayOutcome(){
+  const host = document.getElementById("payOutcome"); if(!host) return;
+  const checked = document.querySelector('input[name="paym"]:checked');
+  const method = checked ? checked.value : "Cash";
+  const combo = !!COMBO_METHODS[method];
+  const single = !combo && method!=="Split Payment" && method!=="Credit" && method!=="Advance Payment";
+  if((!single && !combo) || !state.cart.length){ host.innerHTML = ""; return; }
+  const cust = state.activeCustomer;
+  const { total } = cartTotals();
+  const creditAvail = cust ? customerStoreCredit(cust.id) : 0;
+  const applied = r2(Math.min(creditAvail, total, Math.max(0, +(document.getElementById("storeCreditApply")?.value||0))));
+  const due = r2(Math.max(0, total - applied));
+  let received;
+  if(single){ const el = document.getElementById("amountReceived"); received = r2(Math.max(0, el && el.value!=="" ? +el.value : due)); }
+  else received = r2([...document.querySelectorAll(".comboAmt")].reduce((a,i)=>a+(+i.value||0),0));
+  const diff = r2(received - due);
+  let html = "";
+  if(diff > 0.009){
+    if(cust){
+      const owing = customerDebit(cust);
+      const sel = `<div class="cart-row"><span>Extra amount</span><select id="excessMode" style="padding:5px 8px;border-radius:6px;border:1px solid var(--line)">
+        <option value="account" ${excessModePref==="account"?"selected":""}>Keep on customer's account</option>
+        <option value="change" ${excessModePref==="change"?"selected":""}>Give back as change (cash)</option></select></div>`;
+      if(excessModePref==="change"){
+        html = `${sel}<div class="ca-row ca-ok"><span>Change to give back</span><b>${money(diff)}</b></div>`;
+      } else {
+        const toDebt = r2(Math.min(owing, diff)), toCredit = r2(diff - toDebt);
+        html = `${sel}<div class="ca-row"><span>Excess received</span><b>${money(diff)}</b></div>
+          ${toDebt>0.009 ? `<div class="ca-row"><span>→ clears previous debit</span><span class="ca-ok">${money(toDebt)}</span></div>` : ""}
+          ${toCredit>0.009 ? `<div class="ca-row"><span>→ added to store credit</span><span class="ca-ok">${money(toCredit)}</span></div>` : ""}`;
+      }
+    } else {
+      html = `<div class="ca-row ca-ok"><span>Change to give back</span><b>${money(diff)}</b></div>`;
+    }
+  } else if(diff < -0.009){
+    html = cust
+      ? `<div class="ca-row"><span>Short by</span><b class="ca-bad">${money(-diff)}</b></div><div class="ca-hint">The shortfall is saved as a debt on ${escapeHtml(cust.name)}'s account.</div>`
+      : `<div class="ca-hint ca-bad">⚠️ Short by ${money(-diff)} — select a customer to record the balance as credit.</div>`;
+  } else if(received > 0.009){
+    html = `<div class="ca-hint ca-ok">✔ Exact payment</div>`;
+  }
+  host.innerHTML = html;
+  const sel = document.getElementById("excessMode");
+  if(sel) sel.addEventListener("change", ()=>{ excessModePref = sel.value; updatePayOutcome(); });
+}
 function renderCustAccountPanel(total){
   const host = document.getElementById("custAccountPanel"); if(!host) return;
   const c = state.activeCustomer;
@@ -1780,8 +1914,8 @@ function renderCustAccountPanel(total){
     ${applied>0.009 ? `<div class="ca-row"><span>Store credit applied</span><span class="ca-ok">-${money(applied)}</span></div>` : ""}
     <div class="ca-row"><span>Due for this sale</span><b>${money(saleDue)}</b></div>
     ${debit>0.009 ? `<div class="ca-row"><span>Previous debit</span><span class="ca-bad">+${money(debit)}</span></div>
-    <div class="ca-row ca-total"><span>Overall owed (incl. previous debit)</span><span>${money(r2(saleDue+debit))}</span></div>
-    <div class="ca-hint">Previous debit is settled from Credit &amp; Advance &rarr; Customer Accounts.</div>` : ""}` : ""}`;
+    <div class="ca-row ca-total"><span>Total payable (sale + previous debit)</span><span>${money(r2(saleDue+debit))}</span></div>
+    <div class="ca-hint">Any extra paid clears the previous debit first (oldest first), then is kept as store credit.</div>` : `<div class="ca-hint">Any extra paid is kept as store credit on the customer's account.</div>`}` : ""}`;
 }
 // "Other item" — a one-off line the cashier types in manually (not in the catalogue).
 function openOtherItemModal(){
@@ -1833,19 +1967,21 @@ function updatePayDetails(){
     const parts = COMBO_METHODS[method];
     host.innerHTML = `<div class="pay-detail-box">
       ${creditNote}
-      <p class="pay-detail-note">Enter how much was paid by each method. They should add up to the amount due (${money(dueAfterCredit)}). If they fall short, the remainder is recorded as credit — select a customer first.</p>
+      <p class="pay-detail-note">Enter how much was paid by each method. They should add up to the amount due (${money(dueAfterCredit)}). If they fall short, the remainder is recorded as credit — select a customer first. If they pay more, the extra is kept on the customer's account (or given as change).</p>
       ${parts.map((p,i)=>`<div class="cart-row"><span>${escapeHtml(p)}</span>
         <input type="number" class="comboAmt" data-method="${escapeHtml(p)}" min="0" value="${i===0?fmtQty(dueAfterCredit):0}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>`).join("")}
       <div class="cart-row total"><span>Remaining</span><span id="comboRemaining">${money(0)}</span></div>
+      <div id="payOutcome"></div>
     </div>`;
     const updateRemaining = ()=>{
       const sum = [...host.querySelectorAll(".comboAmt")].reduce((a,i)=>a+(+i.value||0),0);
       document.getElementById("comboRemaining").textContent = money(Math.max(0, dueAfterCredit-sum));
+      updatePayOutcome();
     };
     host.querySelectorAll(".comboAmt").forEach(i=> i.addEventListener("input", updateRemaining));
     updateRemaining();
   } else if(method==="Split Payment"){
-    host.innerHTML = `<div class="pay-detail-box">${creditNote}<p class="pay-detail-note">You'll break the payment down across any combination of methods in a popup right after you click "Charge & Print". If the total entered is less than the amount due, select a customer so the shortfall can be saved as credit.</p></div>`;
+    host.innerHTML = `<div class="pay-detail-box">${creditNote}<p class="pay-detail-note">You'll break the payment down across any combination of methods in a popup right after you click "Charge & Print". If the total entered is less than the amount due, select a customer so the shortfall can be saved as credit. If it is more, the extra is kept on the customer's account (or given back as cash change).</p></div>`;
   } else if(method==="Credit"){
     host.innerHTML = `<div class="pay-detail-box">
       ${creditNote}
@@ -1860,8 +1996,14 @@ function updatePayDetails(){
       <div class="cart-row"><span>Amount Paid Now</span><input type="number" id="advPaidNow" min="0" value="${fmtQty(dueAfterCredit)}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
     </div>`;
   } else {
-    host.innerHTML = creditNote ? `<div class="pay-detail-box">${creditNote}</div>` : "";
+    // Single method (Cash, Transfer, POS …): the cashier types what the customer actually handed over.
+    // More than the amount due = excess (kept on the customer's account or returned as change); less = balance as credit.
+    host.innerHTML = `<div class="pay-detail-box">${creditNote}
+      <div class="cart-row"><span>Amount Received</span><input type="number" id="amountReceived" min="0" step="0.01" value="${fmtQty(dueAfterCredit)}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
+      <div id="payOutcome"></div></div>`;
+    document.getElementById("amountReceived").addEventListener("input", updatePayOutcome);
   }
+  updatePayOutcome();
 }
 
 let heldSalesCache = [];
@@ -2243,7 +2385,10 @@ async function checkoutInner(){
   }
 
   let amountPaid = payDue, balance = 0, paymentBreakdown = null;
-  const coveredByCredit = payDue <= 0.009; // store credit paid for everything — nothing left to tender
+  let tenderLines = [];                       // money actually received, one line per payment method
+  let tendered = 0, excess = 0, changeGiven = 0;
+  const isTender = method!=="Credit" && method!=="Advance Payment";
+  const coveredByCredit = payDue <= 0.009;    // store credit paid for everything — nothing left to collect
   if(method==="Credit"){
     if(!state.activeCustomer){ toast(`Select or add a customer first — ${method} needs a customer on file.`, "err"); return; }
     const paid = r2(Math.min(payDue, Math.max(0, +document.getElementById("creditPaidNow")?.value||0)));
@@ -2257,21 +2402,43 @@ async function checkoutInner(){
   } else if(method==="Split Payment"){
     const res = await promptSplitPaymentModal(payDue);
     if(res===null) return;
-    paymentBreakdown = res.lines; amountPaid = r2(res.total); balance = Math.max(0, r2(payDue-res.total));
-    if(balance>0.009 && !state.activeCustomer){
-      toast("Split payment is short of the total — select a customer to record the remaining balance as credit.", "err");
-      return;
-    }
+    tenderLines = res.lines.map(l=>({ method:l.method, amount:r2(l.amount) }));
   } else if(COMBO_METHODS[method]){
-    const rows = [...document.querySelectorAll(".comboAmt")].map(i=>({ method:i.dataset.method, amount:Math.max(0,+i.value||0) })).filter(l=>l.amount>0);
+    const rows = [...document.querySelectorAll(".comboAmt")].map(i=>({ method:i.dataset.method, amount:r2(Math.max(0,+i.value||0)) })).filter(l=>l.amount>0);
     if(!rows.length){ toast("Enter at least one amount for the payment breakdown","err"); return; }
-    const sum = rows.reduce((a,l)=>a+l.amount,0);
-    if(sum > payDue + 0.01){ toast("The amounts entered exceed the amount due","err"); return; }
-    paymentBreakdown = rows; amountPaid = r2(sum); balance = Math.max(0, r2(payDue-sum));
-    if(balance>0.009 && !state.activeCustomer){
-      toast(`${method} is short of the amount due — select a customer to record the remaining balance as credit.`, "err");
+    tenderLines = rows;
+  } else {
+    const typed = document.getElementById("amountReceived");
+    const received = r2(Math.max(0, (typed && typed.value!=="") ? +typed.value : payDue));
+    if(received > 0.009) tenderLines = [{ method, amount:received }];
+  }
+  if(isTender){
+    tendered = r2(tenderLines.reduce((a,l)=>a+l.amount,0));
+    if(tendered > payDue + 0.009){
+      // The customer handed over MORE than this sale needs.
+      excess = r2(tendered - payDue);
+      let mode = document.getElementById("excessMode")?.value || "account";
+      if(!state.activeCustomer) mode = "change";
+      if(mode==="change"){
+        const cashIn = tenderLines.filter(l=>l.method==="Cash").reduce((a,l)=>a+l.amount,0);
+        if(cashIn < excess - 0.009){
+          toast("Change can only be given out of the Cash received. Reduce the amount received, or select a customer so the extra is kept on their account.","err", 6000);
+          return;
+        }
+        let left = excess;
+        for(const l of tenderLines.filter(x=>x.method==="Cash")){ const cut = Math.min(l.amount, left); l.amount = r2(l.amount-cut); left = r2(left-cut); }
+        tenderLines = tenderLines.filter(l=>l.amount>0.009);
+        changeGiven = excess; excess = 0;
+      }
+    }
+    const netTendered = r2(tenderLines.reduce((a,l)=>a+l.amount,0));
+    const paidToSale = r2(Math.min(netTendered, payDue));
+    amountPaid = paidToSale; balance = r2(Math.max(0, payDue - paidToSale));
+    if(balance > 0.009 && !state.activeCustomer){
+      toast("The amount received is less than the amount due — select a customer so the balance can be recorded as credit.", "err", 6000);
       return;
     }
+    if(method==="Split Payment" || COMBO_METHODS[method]) paymentBreakdown = tenderLines.length ? tenderLines.map(l=>({ method:l.method, amount:l.amount })) : null;
   }
   // Fold the applied store credit into the recorded amountPaid — it was a
   // real form of payment for this sale, just not new cash. total - amountPaid
@@ -2284,6 +2451,7 @@ async function checkoutInner(){
     cashierId: state.user.id, cashierName: state.user.name,
     customerId: state.activeCustomer?.id||null, customerName: state.activeCustomer?.name||"Walk-in",
     items: lines, subtotal, discount, taxPct, tax, total, amountPaid, balance, paymentBreakdown,
+    amountReceived: isTender ? tendered : r2(amountPaid - creditApplied), changeGiven,
     paymentMethod: method, notes, status: balance>0.009 ? "Partial/Owing" : "Paid", creditApplied,
     // Account snapshot at the moment of sale (printed on the receipt)
     creditBefore: state.activeCustomer ? r2(creditAvailable) : 0,
@@ -2303,20 +2471,23 @@ async function checkoutInner(){
       type:"sale", change:-l.qtyInStockUnit, reference:receiptNumber, createdAt:Date.now(), by:state.user.name });
   }
 
-  // save each payment method to the payments ledger
+  // save each payment method to the payments ledger (the ledger always equals the money really received, once)
   if(paymentBreakdown){
     for(const l of paymentBreakdown){
       await dataSet("payments", { id:genId("pay"), type:"split", saleId:sale.id, receiptNumber,
         method:l.method, amount:l.amount, createdAt:Date.now(), by:state.user.name });
     }
-  } else {
-    // amountPaid may include folded-in store credit (added above) — the
-    // ledger entry for the tendered method should only reflect the actual
-    // cash/transfer/etc portion, so cash reconciliation isn't inflated.
+  } else if(!isTender){
+    // Credit / Advance: amountPaid includes folded-in store credit — the ledger only gets the actual tender.
     const tenderPaid = r2(amountPaid - creditApplied);
     if(tenderPaid > 0.009){
       await dataSet("payments", { id:genId("pay"), type:"sale", saleId:sale.id, receiptNumber,
         method, amount:tenderPaid, createdAt:Date.now(), by:state.user.name });
+    }
+  } else {
+    for(const l of tenderLines){
+      await dataSet("payments", { id:genId("pay"), type:"sale", saleId:sale.id, receiptNumber,
+        method:l.method, amount:l.amount, createdAt:Date.now(), by:state.user.name });
     }
   }
 
@@ -2366,6 +2537,17 @@ async function checkoutInner(){
     await dataSet("advancePayments", adv); state.advances.push(adv);
     await syncAdvanceDebt(adv);
   }
+  // Excess payment -> customer's account: oldest debts first, the rest becomes store credit.
+  if(excess > 0.009 && state.activeCustomer){
+    const res = await allocateExcess(state.activeCustomer, excess, method, sale);
+    sale.excessToDebt = res.toDebt; sale.excessToCredit = res.toCredit; sale.excessAllocations = res.allocations;
+  }
+  // Account position AFTER everything above — printed on the receipt.
+  if(state.activeCustomer){
+    sale.creditAfter = r2(customerStoreCredit(state.activeCustomer.id));
+    sale.debitAfter = customerDebit(state.activeCustomer);
+  }
+  await dataSet("sales", sale);
   await dataSet("receipts", { id: sale.id, ...sale });
   state.receipts.push(sale);
 
@@ -2405,7 +2587,7 @@ function promptSplitPaymentModal(total){
     const rowsHost = document.getElementById("spRows");
     const updateRemaining = ()=>{
       const sum = [...rowsHost.children].reduce((a,r)=>a+(+r.querySelector(".spAmt").value||0),0);
-      document.getElementById("spRemaining").textContent = money(Math.max(0,total-sum));
+      document.getElementById("spRemaining").textContent = sum > total + 0.009 ? "Excess " + money(sum-total) : money(Math.max(0,total-sum));
     };
     const addRow = (method, amount)=>{
       const row = document.createElement("div");
@@ -2427,8 +2609,7 @@ function promptSplitPaymentModal(total){
       const lines = [...rowsHost.children].map(r=>({ method:r.querySelector(".spMethod").value, amount:+r.querySelector(".spAmt").value||0 })).filter(l=>l.amount>0);
       if(!lines.length){ toast("Add at least one payment line","err"); return; }
       const sum = lines.reduce((a,l)=>a+l.amount,0);
-      if(sum > total + 0.01){ toast("Split amounts exceed the total due","err"); return; }
-      close({ lines, total: sum });
+      close({ lines, total: sum }); // more than the total due is allowed — checkout keeps the extra on the customer's account or gives change
     };
   });
 }
@@ -2437,14 +2618,43 @@ function promptSplitPaymentModal(total){
    17. RECEIPT RENDERING / PRINTING / PDF
 ------------------------------------------------------------------ */
 /* Account summary block (store credit / debit snapshot taken at checkout). */
+// Shared by the on-screen/print receipt and the PDF so both always show the same figures.
+function accountSummaryRows(sale){
+  if(!sale.customerId) return [];
+  const rows = [];
+  const add = (label, value, strong)=> rows.push({ label, value, strong:!!strong });
+  const cb = +sale.creditBefore||0, pd = +sale.prevDebit||0, da = +sale.debitAfter||0, ca = +sale.creditApplied||0;
+  const recv = +sale.amountReceived||0, chg = +sale.changeGiven||0, toD = +sale.excessToDebt||0, toC = +sale.excessToCredit||0;
+  if(sale.creditAfter!=null){
+    const ck = +sale.creditAfter||0;
+    const saleDue = r2(Math.max(0, (+sale.total||0) - ca));
+    if(cb>0.009) add("Store Credit Before Sale", money(cb));
+    if(pd>0.009) add("Previous Debit", money(pd));
+    add("This Sale", money(sale.total));
+    if(ca>0.009) add("Store Credit Applied", "-"+money(ca));
+    if(pd>0.009) add("Total Due (Sale + Previous Debit)", money(r2(saleDue+pd)), true);
+    if(recv>0.009) add("Amount Received", money(recv));
+    if(chg>0.009) add("Change Given", "-"+money(chg));
+    if(toD>0.009) add("Extra Applied to Previous Debit", money(toD));
+    if(toC>0.009) add("Extra Added to Store Credit", money(toC));
+    rows.push({ rule:true });
+    if(da>0.009) add("Overall Debit (Owing)", money(da), true);
+    if(ck>0.009) add("Store Credit Balance", money(ck), true);
+    if(da<=0.009 && ck<=0.009) add("Account Balance", "Cleared", true);
+    return rows;
+  }
+  // receipts made before this feature keep their original layout
+  if(!(cb>0.009 || pd>0.009 || da>0.009)) return [];
+  if(cb>0.009) add("Store Credit Before Sale", money(cb));
+  if(pd>0.009) add("Previous Debit", money(pd));
+  if(da>0.009 || pd>0.009) add("Total Debit After Sale", money(da), true);
+  return rows;
+}
 function accountSummaryHTML(sale){
-  if(!sale.customerId) return "";
-  const cb = +sale.creditBefore||0, pd = +sale.prevDebit||0, da = +sale.debitAfter||0;
-  if(!(cb>0.009 || pd>0.009 || da>0.009)) return "";
-  return `<hr><div class="r-center" style="font-weight:700">Account Summary</div>
-    ${cb>0.009 ? `<div class="r-row"><span>Store Credit Before Sale</span><span>${money(cb)}</span></div>` : ""}
-    ${pd>0.009 ? `<div class="r-row"><span>Previous Debit</span><span>${money(pd)}</span></div>` : ""}
-    ${(da>0.009 || pd>0.009) ? `<div class="r-row" style="font-weight:600"><span>Total Debit After Sale</span><span>${money(da)}</span></div>` : ""}`;
+  const rows = accountSummaryRows(sale);
+  if(!rows.length) return "";
+  return `<hr><div class="r-center" style="font-weight:700">Account Summary</div>` + rows.map(r=> r.rule ? `<hr>` :
+    `<div class="r-row" style="${r.strong?"font-weight:700":""}"><span>${escapeHtml(r.label)}</span><span>${escapeHtml(r.value)}</span></div>`).join("");
 }
 /* Dated log of products collected against an advance payment. */
 function advanceCollectionsHTML(sale){
@@ -2474,7 +2684,7 @@ function buildReceiptHTML(sale, layout){
   // non-zero so the customer always sees where they stand.
   const creditAppliedLine = sale.creditApplied>0.009 ? `<div class="r-row"><span>Store Credit Applied</span><span>-${money(sale.creditApplied)}</span></div>` : "";
   const storeCreditRemaining = sale.customerId ? customerStoreCredit(sale.customerId) : (sale.creditBalance||0);
-  const storeCreditLine = storeCreditRemaining>0.009 ? `<div class="r-row" style="font-weight:600"><span>Store Credit Balance</span><span>${money(storeCreditRemaining)}</span></div>` : "";
+  const storeCreditLine = (sale.creditAfter==null && storeCreditRemaining>0.009) ? `<div class="r-row" style="font-weight:600"><span>Store Credit Balance</span><span>${money(storeCreditRemaining)}</span></div>` : "";
   return `
   <div class="receipt ${layout}" id="receiptRoot">
     <div class="r-center"><b style="font-size:15px">${escapeHtml(s.name||"HARAMOS ENTERPRISE")}</b><br>${escapeHtml(s.phone||"")}<br>${escapeHtml(s.address||"")}</div>
@@ -2494,6 +2704,7 @@ function buildReceiptHTML(sale, layout){
     <div class="r-row" style="font-weight:700;font-size:1.1em"><span>TOTAL</span><span>${money(sale.total)}</span></div>
     <div class="r-row"><span>Paid</span><span>${money(sale.amountPaid)}</span></div>
     ${creditAppliedLine}
+    ${(!sale.customerId && sale.changeGiven>0.009) ? `<div class="r-row"><span>Amount Received</span><span>${money(sale.amountReceived)}</span></div><div class="r-row"><span>Change</span><span>${money(sale.changeGiven)}</span></div>` : ""}
     ${balanceLine}
     <div class="r-row"><span>Payment</span><span>${escapeHtml(sale.paymentMethod)}</span></div>
     ${breakdownLines}
@@ -2585,6 +2796,8 @@ function downloadReceiptPDF(sale){
       };
       const row = (label, value, bold=false)=>{
         pdf.setFont("courier", bold?"bold":"normal"); pdf.setFontSize(9); pdf.setTextColor(0,0,0);
+        // a long label would run into the amount — put the amount on its own line instead
+        if(pt(label).length + pt(value).length > 33){ pdf.text(pt(label), L, y); y+=11; pdf.text(pt(value), R, y, {align:"right"}); y+=12; return; }
         pdf.text(pt(label), L, y); pdf.text(pt(value), R, y, {align:"right"}); y+=12;
       };
       text(s.name||"HARAMOS ENTERPRISE", { bold:true, size:12, center:true, gap:14 });
@@ -2617,6 +2830,7 @@ function downloadReceiptPDF(sale){
       row("Balance", pm(sale.balance||0));
       row("Payment", sale.paymentMethod||"");
       (sale.paymentBreakdown||[]).forEach(l=> row("  "+l.method, pm(l.amount)));
+      if(!sale.customerId && sale.changeGiven>0.009){ row("Amount Received", pm(sale.amountReceived)); row("Change", pm(sale.changeGiven)); }
       if(sale.history && sale.history.length){
         y+=4; text("Payment History", { bold:true, gap:12 });
         sale.history.forEach(h=> row(acctDay(h.date), pm(h.amount)));
@@ -2637,15 +2851,13 @@ function downloadReceiptPDF(sale){
         collLog.forEach(e=>{ text(`${acctDay(e.date)} ${fmtQty(e.qty)} ${e.unit||""}`, { gap:11 }); text(`  ${e.productName}`, { gap:13 }); });
       }
       if(sale.customerId){
-        const cb = +sale.creditBefore||0, pd = +sale.prevDebit||0, da = +sale.debitAfter||0;
-        if(cb>0.009 || pd>0.009 || da>0.009){
+        const sumRows = accountSummaryRows(sale);
+        if(sumRows.length){
           y+=4; text("Account Summary", { bold:true, gap:12 });
-          if(cb>0.009) row("Store Credit Before", pm(cb));
-          if(pd>0.009) row("Previous Debit", pm(pd));
-          if(da>0.009 || pd>0.009) row("Total Debit After Sale", pm(da));
+          sumRows.forEach(r=>{ if(r.rule){ y+=2; } else row(r.label, r.value, r.strong); });
         }
         const left = customerStoreCredit(sale.customerId);
-        if(left>0.009) row("Store Credit Balance", pm(left));
+        if(sale.creditAfter==null && left>0.009) row("Store Credit Balance", pm(left));
       }
       y+=10;
       text(s.footer||"Thank you for shopping with us!", { center:true, gap:12 });
@@ -3126,6 +3338,20 @@ window.deleteSale = function(id){
         notes:`Store credit restored — receipt ${sale.receiptNumber} was deleted`, createdAt:Date.now() };
       await dataSet("advancePayments", back); state.advances.push(back);
     }
+    // Undo what an excess payment on this receipt did to the customer's account.
+    for(const al of (sale.excessAllocations||[])){
+      const d = state.debts.find(x=>x.id===al.debtId);
+      if(d) await unapplyDebtPayment(d, al.amount, sale.receiptNumber);
+    }
+    for(const a of state.advances.filter(x=>x.excessOf===sale.id)){
+      if((a.creditUsed||0) > 0.009){
+        toast("Part of the excess credit from this receipt was already spent by the customer — only the unspent part was removed.","warn",7000);
+        a.creditBalance = 0; await dataSet("advancePayments", a);
+      } else {
+        await dataDelete("advancePayments", a.id);
+        state.advances = state.advances.filter(x=>x.id!==a.id);
+      }
+    }
     const linkedDebt = state.debts.find(d=>d.saleId===sale.id);
     const linkedAdv = state.advances.find(a=>a.saleId===sale.id);
     if(linkedDebt){ await dataDelete("debts", linkedDebt.id); state.debts = state.debts.filter(d=>d.id!==linkedDebt.id); }
@@ -3453,45 +3679,8 @@ window.recordDebtPayment = function(id){
     const amt = Math.min(debt.balance, Math.max(0, +document.getElementById("dbtAmt").value||0));
     const method = document.getElementById("dbtMethod").value;
     if(!(amt>0.009)){ toast("Enter a payment amount greater than zero","err"); return; }
-    debt.history = debt.history || [];
-    if(debt.advanceId){
-      // This debt mirrors the shortfall between goods collected and amount
-      // paid on a linked Advance Payment. Settle it by crediting the
-      // payment onto the advance itself and re-deriving the balance from
-      // that — crediting both the advance AND decrementing debt.balance
-      // directly would count the same payment twice.
-      debt.history.push({amount:amt, date:Date.now(), method, by:state.user.name});
-      const adv = state.advances.find(a=>a.id===debt.advanceId);
-      if(adv){
-        adv.amountPaid += amt;
-        await dataSet("advancePayments", adv);
-        await syncAdvanceDebt(adv);
-      } else {
-        // orphaned link (advance record no longer exists) — settle plainly
-        debt.amountPaid += amt; debt.balance -= amt;
-        await dataSet("debts", debt);
-      }
-    } else {
-      debt.amountPaid += amt; debt.balance -= amt; debt.history.push({amount:amt, date:Date.now(), method, by:state.user.name});
-      await dataSet("debts", debt);
-    }
+    await applyDebtPayment(debt, amt, method);
     await dataSet("payments", { id:genId("pay"), type:"debt", debtId:debt.id, receiptNumber:debt.receiptNumber, method, amount:amt, createdAt:Date.now(), by:state.user.name });
-    // Push this payment's progress back onto the original sale so Sales
-    // History (and its receipt) automatically reflect the customer's
-    // current debit/credit balance instead of the one-time snapshot
-    // recorded at checkout.
-    if(debt.saleId){
-      const linkedSale = state.sales.find(s=>s.id===debt.saleId);
-      if(linkedSale){
-        linkedSale.amountPaid = debt.amountPaid;
-        linkedSale.balance = debt.balance;
-        linkedSale.status = debt.balance<=0.009 ? "Paid" : "Partial/Owing";
-        await dataSet("sales", linkedSale);
-        await dataSet("receipts", { id:linkedSale.id, ...linkedSale });
-        const rxIdx = state.receipts.findIndex(r=>r.id===linkedSale.id);
-        if(rxIdx>-1) state.receipts[rxIdx] = { id:linkedSale.id, ...linkedSale };
-      }
-    }
     closeModal(); toast("Payment recorded","ok"); drawCreditTab("debts");
   };
 };
