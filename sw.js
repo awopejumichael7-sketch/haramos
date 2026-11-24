@@ -2,7 +2,7 @@
 // Purpose: make the app installable and usable offline.
 // It does NOT touch your data (that all lives in IndexedDB, untouched).
 
-const CACHE_NAME = "excellence-store-pos-v10";
+const CACHE_NAME = "excellence-store-pos-v13";
 // Everything (manifest, icons) is now embedded inside index.html itself,
 // so the app shell is just the one file plus its own root URL.
 const CORE_ASSETS = [

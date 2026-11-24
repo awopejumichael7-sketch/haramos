@@ -808,6 +808,7 @@ async function dataSet(collection, obj){
     try{
       const { doc, setDoc } = firestoreApi;
       await setDoc(doc(fbDb, collection, obj.id), obj);
+      await dropSupersededQueue(collection, obj.id); // an older offline copy of this record must not be re-sent later
       return obj;
     }catch(e){ console.warn("Firestore write failed, queueing", e); }
   }
@@ -821,13 +822,24 @@ async function dataDelete(collection, id){
     try{
       const { doc, deleteDoc } = firestoreApi;
       await deleteDoc(doc(fbDb, collection, id));
+      await dropSupersededQueue(collection, id);
       return true;
     }catch(e){ console.warn("Firestore delete failed, queueing", e); }
   }
   await queueSync(collection, "delete", { id });
   return true;
 }
+// Only the LATEST operation on a record matters. Older queued ones are dropped, so a stale copy that was waiting
+// to upload can never later overwrite (or resurrect) something newer.
+async function dropSupersededQueue(collection, id){
+  try{
+    for(const q of await idbGetAll("syncQueue")){
+      if(q.collection===collection && q.obj && q.obj.id===id) await idbDelete("syncQueue", q.id);
+    }
+  }catch(e){ console.warn("Could not tidy the sync queue", e); }
+}
 async function queueSync(collection, op, obj){
+  await dropSupersededQueue(collection, obj.id);
   await idbPut("syncQueue", { id: genId("syncQueue"), collection, op, obj, queuedAt: Date.now() });
   updateConnPill();
 }
@@ -880,12 +892,17 @@ const USERS = [
 ];
 
 const PERMISSIONS = {
-  admin: { deleteProducts:true, editUsers:true, changeSettings:true, deleteSales:true, priceOverride:true, editCreditRecords:true },
-  sales: { deleteProducts:false, editUsers:false, changeSettings:false, deleteSales:false, priceOverride:true, editCreditRecords:false }
+  admin: { deleteProducts:true, editUsers:true, changeSettings:true, deleteSales:true, priceOverride:true, editCreditRecords:true, deleteRecords:true },
+  sales: { deleteProducts:false, editUsers:false, changeSettings:false, deleteSales:false, priceOverride:true, editCreditRecords:false, deleteRecords:false }
 };
 
-const STORE = { name:"HARAMOS ENTERPRISE", phone:"08060004726", address:"5 Oke Aro Street, Ikangba Town, Odogbolu, Ogun State", footer:"Thank you for shopping with us!",
-  currency:"₦", taxRate:0, returnPolicy:"Thanks for your patronage." };
+const RECEIPT_FOOTER = "THANK YOU FOR FEEDING YOUR FISH AND POULTRY WITH OUR PRODUCTS.\n\nI REALLY APPRECIATE YOUR CONTINUED PATRONAGE.";
+const FOOTER_VERSION = 2; // bump to push a new default footer to every device once
+const STORE = { name:"HARAMOS ENTERPRISE", phone:"08060004726", address:"5 Oke Aro Street, Ikangba Town, Odogbolu, Ogun State", footer:RECEIPT_FOOTER,
+  currency:"₦", taxRate:0, returnPolicy:"", footerVersion:FOOTER_VERSION };
+// Footer text -> safe HTML (keeps the blank line between the two sentences) / plain lines for PDFs.
+function footerHTML(t){ return escapeHtml(t||RECEIPT_FOOTER).replace(/\r?\n/g,"<br>"); }
+function footerLines(t){ return String(t||RECEIPT_FOOTER).split(/\r?\n/); }
 
 /* ------------------------------------------------------------------
    5. SEED PRODUCTS
@@ -1022,6 +1039,14 @@ async function reloadAll(){
   state.returns = await dataGetAll("returns");
   const storeSettings = await idbGet("settings", "store_info");
   state.settings = storeSettings || STORE;
+  // One-time switch to the new receipt footer on every device. The old "Thanks for your patronage." line is
+  // removed too (the new footer already says it); a different return policy someone typed is left alone.
+  if((state.settings.footerVersion||0) < FOOTER_VERSION){
+    const migrated = Object.assign({}, state.settings, { id:"store_info", footer:RECEIPT_FOOTER, footerVersion:FOOTER_VERSION });
+    if(String(migrated.returnPolicy||"").trim().toLowerCase().replace(/[.!\s]+$/,"") === "thanks for your patronage") migrated.returnPolicy = "";
+    state.settings = migrated;
+    state.settingsNeedsSave = true;
+  }
 }
 
 /* ------------------------------------------------------------------
@@ -1317,6 +1342,10 @@ async function restoreSession(){
 
 function enterApp(user){
   state.user = user;
+  if(state.settingsNeedsSave && can("changeSettings")){ // save the new footer for all devices (Admin only)
+    state.settingsNeedsSave = false;
+    dataSet("settings", state.settings).catch(e=>console.warn("Could not save new footer", e));
+  }
   document.getElementById("loginScreen").classList.add("hidden");
   document.getElementById("mainScreen").classList.remove("hidden");
   document.getElementById("userName").textContent = user.name;
@@ -1325,11 +1354,13 @@ function enterApp(user){
   renderNav();
   goPage(DEFAULT_PAGE_FOR_ROLE[user.role] || "dashboard");
   resetIdleTimer();
+  startSettingsSync(); // live settings / account updates from the cloud
   toast(`Welcome back, ${user.name.split(" ")[0]}!`, "ok");
 }
 
 document.getElementById("logoutBtn").addEventListener("click", logout);
 function logout(){
+  stopSettingsSync();
   sessionStorage.removeItem("pos_session");
   if(FIREBASE_AUTH_READY && fbAuth && firebaseAuthApi){
     firebaseAuthApi.signOut(fbAuth).catch(e=>console.warn("[Firebase Auth] Sign-out error", e));
@@ -1477,7 +1508,8 @@ async function updateConnPill(){
   const q = await idbGetAll("syncQueue").catch(()=>[]);
   setConn(q.length ? "syncing" : "online");
 }
-window.addEventListener("online", ()=>{ updateConnPill(); flushSyncQueue(); toast("Back online — syncing data…","ok"); });
+window.addEventListener("online", async ()=>{ updateConnPill(); toast("Back online — syncing data…","ok"); await flushSyncQueue(); pullSettingsNow(); updateSyncStatus(); });
+window.addEventListener("offline", ()=>{ updateConnPill(); updateSyncStatus(); });
 window.addEventListener("offline", ()=>{ setConn("offline"); toast("You are offline. Sales will keep working and sync later.","warn"); });
 
 /* ------------------------------------------------------------------
@@ -2079,7 +2111,7 @@ async function renderSales(){
   });
   buildMethodBtns("payMethods", PAYMENT_METHODS_STANDARD);
   buildMethodBtns("payMethodsSpecial", PAYMENT_METHODS_SPECIAL);
-  document.querySelectorAll('input[name="paym"]').forEach(r=> r.addEventListener("change", updatePayDetails));
+  document.querySelectorAll('input[name="paym"]').forEach(r=> r.addEventListener("change", renderCart)); // renderCart also refreshes the payment box + default "carrying now"
   updatePayDetails();
   renderPosGrid();
   document.getElementById("posSearch").addEventListener("input", renderPosGrid);
@@ -2148,6 +2180,19 @@ function addToCart(product, unitName){
     qty:1, unitPrice:unitPriceFor(product, unit), unitCost:product.costPrice, override:false });
   renderCart();
 }
+// How much of a line the customer physically takes away today. Default: everything (carry 0 for an Advance Payment,
+// where goods are reserved). The cashier can lower it — the rest stays in the shop, reserved for the customer.
+function lineCarry(c){
+  if(c.custom) return c.qty;
+  const checked = document.querySelector('input[name="paym"]:checked');
+  const dflt = (checked && checked.value==="Advance Payment") ? 0 : c.qty;
+  if(c.carry==null) return dflt;
+  return Math.min(c.qty, Math.max(0, c.carry));
+}
+function collectionStatusOf(products){
+  if(!products.length || products.every(p=>p.collected >= p.reserved-1e-9)) return "Fully Collected";
+  return products.some(p=>p.collected>0) ? "Partially Collected" : "Not Collected";
+}
 function renderCart(){
   const box = document.getElementById("cartItems"); if(!box) return;
   // A product removed from the catalogue after it was added to the cart (or to a held sale) must not break the screen.
@@ -2199,8 +2244,21 @@ function renderCart(){
           <select class="unitSelect">${units.map(u=>`<option ${u===c.unit?"selected":""}>${u}</option>`).join("")}</select>
           ${can("priceOverride")?`<input type="number" class="priceOverride" title="Override price" value="${c.unitPrice}" style="width:70px;padding:4px;border-radius:6px;border:1px solid var(--line)">`:""}
         </div>
+        ${(()=>{ const carry = lineCarry(c), left = r2(c.qty - carry);
+          return `<div class="carry-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px;font-size:12.5px;padding:6px 8px;border-radius:8px;background:${left>0.009?"rgba(230,160,0,.13)":"var(--bg)"}">
+            <span>🚚 <b>Carrying now</b></span>
+            <input type="number" class="carryInput" min="0" max="${c.qty}" step="0.01" value="${carry}" title="How many the customer takes with them today" style="width:78px;padding:4px 6px;border-radius:6px;border:1px solid var(--line)">
+            <span>of ${fmtQty(c.qty)} ${escapeHtml(c.unit)}</span>
+            ${left>0.009 ? `<b style="color:#b36b00">${fmtQty(left)} ${escapeHtml(c.unit)} left for later</b>` : `<span style="color:var(--ink-soft)">all taken</span>`}
+          </div>`; })()}
       </div>`;
-    }).join("");
+    }).join("") + (()=>{
+      const prodLines = state.cart.filter(c=>!c.custom);
+      const carriedUnits = prodLines.reduce((a,c)=>a+lineCarry(c),0), totalU = prodLines.reduce((a,c)=>a+c.qty,0), leftU = r2(totalU-carriedUnits);
+      return (prodLines.length && leftU>0.009)
+        ? `<div style="margin:8px 0 2px;padding:8px 10px;border-radius:10px;background:rgba(230,160,0,.15);font-size:12.5px">📦 <b>Carrying now: ${fmtQty(carriedUnits)}</b> · <b>Left for later: ${fmtQty(leftU)}</b><br><span style="color:var(--ink-soft)">The rest stays reserved for the customer and is tracked on their account and receipt.</span></div>` : "";
+    })();
+    box.querySelectorAll(".carryInput").forEach(b=> b.addEventListener("change",(e)=>{ const i=+e.target.closest(".cart-line").dataset.idx; const line=state.cart[i]; line.carry = Math.min(line.qty, Math.max(0, +e.target.value||0)); renderCart(); }));
     box.querySelectorAll(".removeLine").forEach(b=> b.addEventListener("click",(e)=>{ state.cart.splice(+e.target.closest(".cart-line").dataset.idx,1); renderCart(); }));
     box.querySelectorAll(".decQty").forEach(b=> b.addEventListener("click",(e)=>{ const i=+e.target.closest(".cart-line").dataset.idx; state.cart[i].qty=Math.max(0.01,state.cart[i].qty-1); renderCart(); }));
     box.querySelectorAll(".incQty").forEach(b=> b.addEventListener("click",(e)=>{ const i=+e.target.closest(".cart-line").dataset.idx; state.cart[i].qty+=1; renderCart(); }));
@@ -2381,9 +2439,13 @@ async function checkoutInner(){
       return;
     }
     lines.push({ productId:product.id, productName:product.name, unit:c.unit, qtySold:c.qty,
-      qtyInStockUnit:deduction, unitPrice:c.unitPrice, unitCost:product.costPrice });
+      qtyInStockUnit:deduction, unitPrice:c.unitPrice, unitCost:product.costPrice, carried:r2(lineCarry(c)) });
   }
 
+  if(method!=="Advance Payment" && !state.activeCustomer && lines.some(l=>!l.isCustom && l.carried < l.qtySold - 1e-9)){
+    toast("Some goods are being left for later — select the customer first so the rest is recorded on their account.", "err", 6000);
+    return;
+  }
   let amountPaid = payDue, balance = 0, paymentBreakdown = null;
   let tenderLines = [];                       // money actually received, one line per payment method
   let tendered = 0, excess = 0, changeGiven = 0;
@@ -2512,7 +2574,10 @@ async function checkoutInner(){
   }
 
   // route the outstanding balance / reservation to the right place
-  const advProducts = lines.filter(l=>!l.isCustom).map(l=>({ productId:l.productId, productName:l.productName, reserved:l.qtySold, unit:l.unit, collected:0, unitPrice:l.unitPrice }));
+  const advProducts = lines.filter(l=>!l.isCustom).map(l=>({ productId:l.productId, productName:l.productName, reserved:l.qtySold, unit:l.unit, collected:l.carried, unitPrice:l.unitPrice }));
+  const collectionLog = lines.filter(l=>!l.isCustom && l.carried>0.0001).map(l=>({ date:Date.now(), productName:l.productName, unit:l.unit, qty:l.carried, by:state.user.name }));
+  const leftBehind = advProducts.some(p=>p.collected < p.reserved-1e-9);
+  const pickupStatus = collectionStatusOf(advProducts);
   if(balance>0.009 && state.activeCustomer){
     if(method!=="Advance Payment"){
       // Credit, Split Payment, or any of the combo methods (POS+Cash, Transfer+Cash, Transfer+POS+Cash)
@@ -2523,7 +2588,7 @@ async function checkoutInner(){
     } else if(method==="Advance Payment"){
       const adv = { id:genId("adv"), customerId:state.activeCustomer.id, customerName:state.activeCustomer.name,
         phone:state.activeCustomer.phone||"", saleId:sale.id, receiptNumber, amountPaid, total, balance, creditBalance:0,
-        products: advProducts, collectionStatus:"Not Collected", createdAt:Date.now() };
+        products: advProducts, collections: collectionLog, collectionStatus:pickupStatus, createdAt:Date.now() };
       await dataSet("advancePayments", adv); state.advances.push(adv);
       await syncAdvanceDebt(adv);
     }
@@ -2533,9 +2598,19 @@ async function checkoutInner(){
     const creditBalance = Math.max(0, r2(amountPaid-total));
     const adv = { id:genId("adv"), customerId:state.activeCustomer.id, customerName:state.activeCustomer.name,
       phone:state.activeCustomer.phone||"", saleId:sale.id, receiptNumber, amountPaid, total, balance:0, creditBalance,
-      products: advProducts, collectionStatus:"Not Collected", createdAt:Date.now() };
+      products: advProducts, collections: collectionLog, collectionStatus:pickupStatus, createdAt:Date.now() };
     await dataSet("advancePayments", adv); state.advances.push(adv);
     await syncAdvanceDebt(adv);
+  }
+  // An ordinary sale (Cash, Transfer, Credit …) where the customer carried only part of the goods: keep a
+  // pick-up record so the rest is tracked for collection later. It carries no money of its own (pickupOnly) —
+  // the payment/debt is already on the sale — so its value is set equal to the goods and nothing is double-counted.
+  if(method!=="Advance Payment" && leftBehind && state.activeCustomer){
+    const goodsValue = r2(advProducts.reduce((a,p)=>a+p.unitPrice*p.reserved,0));
+    const pickup = { id:genId("adv"), customerId:state.activeCustomer.id, customerName:state.activeCustomer.name,
+      phone:state.activeCustomer.phone||"", saleId:sale.id, receiptNumber, amountPaid:goodsValue, total:goodsValue, balance:0, creditBalance:0,
+      products:advProducts, collections:collectionLog, collectionStatus:pickupStatus, pickupOnly:true, createdAt:Date.now() };
+    await dataSet("advancePayments", pickup); state.advances.push(pickup);
   }
   // Excess payment -> customer's account: oldest debts first, the rest becomes store credit.
   if(excess > 0.009 && state.activeCustomer){
@@ -2553,7 +2628,7 @@ async function checkoutInner(){
 
   state.cart = []; state.activeCustomer = null;
   toast(`Sale completed — ${receiptNumber}`, "ok");
-  showReceiptModal(sale);
+  showReceiptModal(enrichSaleWithAdvance(sale)); // adds the Collection Status block (carried now / left for later)
   renderSales();
 }
 function promptPaymentSplit(total){
@@ -2724,8 +2799,8 @@ function buildReceiptHTML(sale, layout){
     <div class="r-center" id="rcBarcode"></div>
     <div class="r-center" id="rcQr" style="margin-top:6px"></div>
     <hr>
-    <div class="r-center">${escapeHtml(s.footer||"Thank you for shopping with us!")}<br>
-    <span style="font-size:.85em">${escapeHtml(s.returnPolicy||"")}</span></div>
+    <div class="r-center">${footerHTML(s.footer)}${s.returnPolicy?`<br>
+    <span style="font-size:.85em">${escapeHtml(s.returnPolicy)}</span>`:""}</div>
   </div>`;
 }
 function printReceipt(sale, layout="w80"){
@@ -2790,7 +2865,7 @@ function downloadReceiptPDF(sale){
       const text = (txt, o={})=>{
         const { x=L, bold=false, size=9, center=false, color=[0,0,0], gap=11 } = o;
         pdf.setFont("courier", bold?"bold":"normal"); pdf.setFontSize(size); pdf.setTextColor(...color);
-        const parts = center ? [pt(txt)] : pdf.splitTextToSize(pt(txt), R-x);
+        const parts = pdf.splitTextToSize(pt(txt), R-x); // wraps centred text too (the new footer is long)
         parts.forEach(p=>{ pdf.text(p, center?CX:x, y, center?{align:"center"}:undefined); y+=gap; });
         pdf.setTextColor(0,0,0);
       };
@@ -2860,7 +2935,7 @@ function downloadReceiptPDF(sale){
         if(sale.creditAfter==null && left>0.009) row("Store Credit Balance", pm(left));
       }
       y+=10;
-      text(s.footer||"Thank you for shopping with us!", { center:true, gap:12 });
+      footerLines(s.footer).forEach(l=>{ if(l.trim()) text(l, { center:true, gap:12 }); else y+=6; });
       if(s.returnPolicy) text(s.returnPolicy, { size:8, center:true, gap:11 });
       return y;
     };
@@ -2897,6 +2972,7 @@ function buildDebtReceiptSale(d){
    not have been recorded) when there's no linked sale. */
 function buildAdvanceReceiptSale(a){
   const original = a.saleId && state.sales.find(s=>s.id===a.saleId);
+  if(original && a.pickupOnly) return Object.assign({}, original, { advanceProducts:a.products||[], advanceCollections:a.collections||[], collectionStatus:a.collectionStatus });
   if(original) return Object.assign({}, original, { amountPaid:a.amountPaid, balance:a.balance, advanceProducts:a.products||[], advanceCollections:a.collections||[], creditBalance:a.creditBalance||0 });
   // A deposit with no products: the receipt total is simply the amount deposited.
   const total = a.isDeposit ? a.amountPaid : (a.total!=null ? a.total : a.amountPaid);
@@ -3050,8 +3126,8 @@ function drawReturnsPdfSection(pdf, sale, y){
 function enrichSaleWithAdvance(sale){
   const adv = state.advances.find(a=>a.saleId===sale.id);
   if(!adv) return sale;
-  return Object.assign({}, sale, { amountPaid:adv.amountPaid, balance:adv.balance,
-    advanceProducts:adv.products||[], advanceCollections:adv.collections||[], collectionStatus:adv.collectionStatus, creditBalance:adv.creditBalance||0 });
+  const money_ = adv.pickupOnly ? {} : { amountPaid:adv.amountPaid, balance:adv.balance, creditBalance:adv.creditBalance||0 }; // pick-up records carry no money of their own
+  return Object.assign({}, sale, money_, { advanceProducts:adv.products||[], advanceCollections:adv.collections||[], collectionStatus:adv.collectionStatus });
 }
 /* Same idea for Credit/Debt sales — a sale paid on credit gets a linked
    `debts` record that keeps its own running amountPaid/balance/history as
@@ -3101,7 +3177,7 @@ function renderReceipts(){
       const adv = state.advances.find(a=>a.saleId===s.id);
       const debt = state.debts.find(d=>d.saleId===s.id);
       const collectionCell = adv
-        ? `<span class="pill ${adv.collectionStatus==="Fully Collected"?"pill-ok":adv.collectionStatus==="Partially Collected"?"pill-warn":"pill-info"}">${adv.collectionStatus}</span>${advCollectedSummaryHTML(adv)}`
+        ? `<span class="pill ${adv.collectionStatus==="Fully Collected"?"pill-ok":adv.collectionStatus==="Partially Collected"?"pill-warn":"pill-info"}">${adv.collectionStatus}</span>${advCollectedSummaryHTML(adv)}${(adv.pickupOnly && debt) ? ` <span class="pill ${debt.balance<=0.009?"pill-ok":"pill-danger"}">${debt.balance<=0.009?"Cleared":"Owing "+money(debt.balance)}</span>` : ""}`
         : debt
         ? `<span class="pill ${debt.balance<=0.009?"pill-ok":"pill-danger"}">${debt.balance<=0.009?"Cleared":"Owing "+money(debt.balance)}</span>`
         : `<span style="color:var(--ink-soft)">—</span>`;
@@ -3293,7 +3369,7 @@ function renderReturnsPage(){
       <tr><td>${fmtDate(r.createdAt)}</td><td class="mono">${r.receiptNumber}</td><td>${escapeHtml(r.customerName)}</td>
       <td>${r.items.map(i=>`${fmtQty(i.qty)} ${escapeHtml(i.unit)} ${escapeHtml(i.productName)}`).join(", ")}</td>
       <td>${money(r.totalRefund)}</td><td><span class="pill pill-info">${escapeHtml(r.refundMethod)}</span></td>
-      <td class="row-actions"><button class="icon-sm" title="View original receipt" onclick="viewReceiptById('${r.saleId}')">🧾</button></td></tr>`).join("")
+      <td class="row-actions"><button class="icon-sm" title="View original receipt" onclick="viewReceiptById('${r.saleId}')">🧾</button>${can("deleteRecords")?`<button class="icon-sm" title="Delete return record" onclick="deleteReturnRecord('${r.id}')">🗑️</button>`:""}</td></tr>`).join("")
       : `<tr><td colspan="7"><div class="empty-state"><div class="ic">↩️</div>No returns processed yet</div></td></tr>`;
   };
   document.getElementById("rtnSearch").addEventListener("input", draw);
@@ -3302,11 +3378,9 @@ function renderReturnsPage(){
 
 /* Admin-only: delete a past sale, restore stock, and remove any linked
    debt / advance-payment records it created. */
-window.deleteSale = function(id){
-  if(!can("deleteSales")){ toast("Only Admin can delete sales.", "err"); return; }
-  const sale = state.sales.find(s=>s.id===id);
-  if(!sale) return;
-  confirmDialog(`Delete receipt <b>${escapeHtml(sale.receiptNumber)}</b>? This restores ${sale.items.length} item(s) back to stock and removes any linked debt/advance record. This cannot be undone.`, async ()=>{
+// The actual deletion (stock back, store credit back, linked records and money trail removed). Used by the
+// Delete dialog and by "delete customer + their sales".
+async function performDeleteSale(sale, opts={}){
     // Goods already handed back through a Return were put back in stock at that
     // time — only restore what is still out, otherwise stock would be counted twice.
     const returns = saleReturnsFor(sale.id);
@@ -3365,8 +3439,19 @@ window.deleteSale = function(id){
     await dataDelete("receipts", sale.id);
     state.sales = state.sales.filter(s=>s.id!==sale.id);
     state.receipts = state.receipts.filter(s=>s.id!==sale.id);
-    toast(`Receipt ${sale.receiptNumber} deleted — stock restored.`, "ok");
-    renderReceipts();
+
+  await logDeletion("Sale / receipt", `${sale.receiptNumber} — ${sale.customerName||"Walk-in"}`, `Total ${money(sale.total)}, ${sale.items.length} item(s); stock restored`);
+}
+window.deleteSale = function(id){
+  if(!can("deleteSales")){ toast("Only Admin can delete sales.", "err"); return; }
+  const sale = state.sales.find(x=>x.id===id);
+  if(!sale) return;
+  openDeleteDialog({
+    title:`Delete receipt ${escapeHtml(sale.receiptNumber)}`,
+    intro:"This puts the goods back into stock, returns any store credit that paid for it, and removes the receipt together with its debt/advance record, returns and payment entries.",
+    facts:[["Customer", escapeHtml(sale.customerName||"Walk-in")],["Date", fmtDate(sale.createdAt)],["Total", money(sale.total)],["Paid", money(sale.amountPaid)],["Items", String(sale.items.length)]],
+    confirmLabel:"Delete receipt",
+    onConfirm: async ()=>{ await performDeleteSale(sale); toast(`Receipt ${sale.receiptNumber} deleted — stock restored.`, "ok"); refreshViews(); }
   });
 };
 
@@ -3390,6 +3475,7 @@ function renderCredit(){
   drawCreditTab("debts");
 }
 function drawCreditTab(tab){
+  window.__creditTab = tab; // remembered so a delete can redraw the tab you are on
   const body = document.getElementById("creditTabBody");
   if(tab==="accounts"){ drawCustomerAccountsTab(body); return; }
   if(tab==="debts"){
@@ -3414,7 +3500,7 @@ function drawCreditTab(tab){
         <td>${money(d.total)}</td><td>${money(d.amountPaid)}</td><td>${money(d.balance)}</td>
         <td>${d.dueDate ? `<span ${overdue?'class="pill pill-danger"':''}>${new Date(d.dueDate).toLocaleDateString("en-NG",{day:"2-digit",month:"short",year:"numeric"})}</span>` : "—"}</td>
         <td><span class="pill ${statusClass}">${statusLabel}</span></td>
-        <td class="row-actions">${d.advanceId?`<button class="icon-sm" title="Open linked Advance Payment" onclick="viewAdvance('${d.advanceId}')">📦</button>`:""}<button class="icon-sm" title="Receipt" onclick="viewDebtReceipt('${d.id}')">🧾</button>${(!d.advanceId && can("editCreditRecords") && d.balance>0.009)?`<button class="icon-sm" title="Write off (uncollectible)" onclick="writeOffDebt('${d.id}')">🚫</button>`:""}${(!d.advanceId && !d.saleId && can("editCreditRecords"))?`<button class="icon-sm" title="Delete record" onclick="deleteManualDebt('${d.id}')">🗑️</button>`:""}<button class="btn btn-sm btn-primary" onclick="recordDebtPayment('${d.id}')" ${d.balance<=0?"disabled":""}>Add Payment</button></td>
+        <td class="row-actions">${d.advanceId?`<button class="icon-sm" title="Open linked Advance Payment" onclick="viewAdvance('${d.advanceId}')">📦</button>`:""}<button class="icon-sm" title="Receipt" onclick="viewDebtReceipt('${d.id}')">🧾</button>${(!d.advanceId && can("editCreditRecords") && d.balance>0.009)?`<button class="icon-sm" title="Write off (uncollectible)" onclick="writeOffDebt('${d.id}')">🚫</button>`:""}${can("deleteRecords")?`<button class="icon-sm" title="Delete record" onclick="deleteDebtRecord('${d.id}')">🗑️</button>`:""}<button class="btn btn-sm btn-primary" onclick="recordDebtPayment('${d.id}')" ${d.balance<=0?"disabled":""}>Add Payment</button></td>
         </tr>`;
       }).join("") : `<tr><td colspan="9"><div class="empty-state"><div class="ic">💳</div>No credit sales yet</div></td></tr>`;
     };
@@ -3436,7 +3522,7 @@ function drawCreditTab(tab){
       <tr><td>${escapeHtml(a.customerName)}</td><td class="mono">${a.receiptNumber}</td><td>${money(a.amountPaid)}</td>
       <td>${a.total===null||a.total===undefined?`<span class="pill pill-warn" title="Goods value not set — balance can't be calculated yet">Unknown</span>`:money(a.balance)}</td><td>${(a.creditBalance||0)>0?`<span class="pill pill-ok">${money(a.creditBalance)}</span>`:money(0)}</td>
       <td><span class="pill pill-info">${a.collectionStatus}</span></td>
-      <td class="row-actions"><button class="icon-sm" title="Receipt" onclick="viewAdvanceReceipt('${a.id}')">🧾</button>${(!a.saleId && can("editCreditRecords"))?`<button class="icon-sm" title="Delete (restores reserved stock)" onclick="deleteManualAdvance('${a.id}')">🗑️</button>`:""}<button class="btn btn-sm btn-ghost" onclick="viewAdvance('${a.id}')">Manage</button></td>
+      <td class="row-actions"><button class="icon-sm" title="Receipt" onclick="viewAdvanceReceipt('${a.id}')">🧾</button>${can("deleteRecords")?`<button class="icon-sm" title="Delete advance payment" onclick="deleteAdvance('${a.id}')">🗑️</button>`:""}<button class="btn btn-sm btn-ghost" onclick="viewAdvance('${a.id}')">Manage</button></td>
       </tr>`).join("") : `<tr><td colspan="7"><div class="empty-state"><div class="ic">📦</div>No advance payments yet</div></td></tr>`;
     };
     document.getElementById("advSearch").addEventListener("input", renderRows);
@@ -3463,13 +3549,9 @@ window.openManualDebtModal = function(){
     const name = document.getElementById("mdCust").value.trim();
     if(!name) return toast("Customer name is required","err");
     const phoneInput = document.getElementById("mdPhone").value.trim();
-    let customer = state.customers.find(c=>c.name.toLowerCase()===name.toLowerCase());
-    if(!customer){
-      customer = { id:genId("cust"), name, phone:phoneInput, address:"", notes:"" };
-      await dataSet("customers", customer); state.customers.push(customer);
-    }
     const total = Math.max(0, +document.getElementById("mdTotal").value||0);
     if(total<=0) return toast("Enter a valid amount owed","err");
+    const customer = await resolveCustomer(name, phoneInput); // existing profile reused — never a second one
     const paid = Math.min(total, Math.max(0, +document.getElementById("mdPaid").value||0));
     const debt = { id:genId("debt"), customerId:customer.id, customerName:customer.name, phone:customer.phone||phoneInput,
       saleId:null, receiptNumber:"CR-"+Date.now().toString().slice(-8), total, amountPaid:paid, balance:total-paid,
@@ -3606,11 +3688,6 @@ window.openManualAdvanceModal = function(){
     const name = document.getElementById("maCust").value.trim();
     if(!name) return toast("Customer name is required","err");
     const phoneInput = document.getElementById("maPhone").value.trim();
-    let customer = state.customers.find(c=>c.name.toLowerCase()===name.toLowerCase());
-    if(!customer){
-      customer = { id:genId("cust"), name, phone:phoneInput, address:"", notes:"" };
-      await dataSet("customers", customer); state.customers.push(customer);
-    }
     const products = [...rows.children].map(r=>{
       const p = state.products.find(x=>x.id===r.querySelector(".maProd").value);
       const unit = r.querySelector(".maUnit").value;
@@ -3636,6 +3713,7 @@ window.openManualAdvanceModal = function(){
         return;
       }
     }
+    const customer = await resolveCustomer(name, phoneInput); // existing profile reused; only created once everything above is valid
     const paid = Math.max(0, +document.getElementById("maPaid").value||0);
     // The Total Value of Goods is never manually typed — it's the exact
     // sum of each reserved product's catalogue price × quantity, the same
@@ -3718,45 +3796,6 @@ window.writeOffDebt = function(id){
 // manually (not one generated by a Sales-screen checkout or an Advance
 // Payment shortfall, both of which must be undone from their own records
 // so linked stock/sale data stays consistent).
-window.deleteManualDebt = function(id){
-  if(!can("editCreditRecords")){ toast("Only an Admin can delete a credit record.", "err"); return; }
-  const debt = state.debts.find(d=>d.id===id);
-  if(!debt) return;
-  if(debt.saleId || debt.advanceId){ toast("This record is linked to a sale or advance — resolve it from there instead.", "warn"); return; }
-  confirmDialog(`Delete this credit record for <b>${escapeHtml(debt.customerName)}</b>? This cannot be undone.`, async ()=>{
-    await dataDelete("debts", debt.id);
-    state.debts = state.debts.filter(d=>d.id!==debt.id);
-    toast("Credit record deleted","ok"); drawCreditTab("debts");
-  });
-};
-// Admin-only: delete a standalone (not Sales-screen-linked) Advance
-// Payment record. Returns whatever reserved-but-uncollected stock it was
-// holding back to inventory, mirroring how deleting a linked sale already
-// restocks its Advance Payment — keeping the two paths consistent.
-window.deleteManualAdvance = function(id){
-  if(!can("editCreditRecords")){ toast("Only an Admin can delete an advance payment.", "err"); return; }
-  const adv = state.advances.find(a=>a.id===id);
-  if(!adv) return;
-  if(adv.saleId){ toast("This advance came from a Sales-screen transaction — delete the sale/receipt instead so stock is restored correctly.", "warn"); return; }
-  confirmDialog(`Delete this advance payment for <b>${escapeHtml(adv.customerName)}</b>? Any reserved-but-not-yet-collected stock will be returned to inventory. This cannot be undone.`, async ()=>{
-    for(const p of (adv.products||[])){
-      const outstanding = Math.max(0, (p.reserved||0) - (p.collected||0));
-      if(outstanding<=0) continue;
-      const product = advProduct(p);
-      if(!product) continue;
-      const restore = stockDeductionFor(product, p.unit, outstanding);
-      product.currentStock = +(product.currentStock + restore).toFixed(4);
-      await dataSet("products", product);
-      await dataSet("stockHistory", { id:genId("stk"), productId:product.id, productName:product.name,
-        type:"Advance deleted (restock)", change:restore, reference:adv.receiptNumber, createdAt:Date.now(), by:state.user.name });
-    }
-    const linkedDebt = state.debts.find(d=>d.advanceId===adv.id);
-    if(linkedDebt){ await dataDelete("debts", linkedDebt.id); state.debts = state.debts.filter(d=>d.id!==linkedDebt.id); }
-    await dataDelete("advancePayments", adv.id);
-    state.advances = state.advances.filter(a=>a.id!==adv.id);
-    toast("Advance payment deleted — reserved stock restored.","ok"); drawCreditTab("advances");
-  });
-};
 window.viewAdvance = function(id){
   const adv = state.advances.find(a=>a.id===id);
   if(!adv.creditBalance) adv.creditBalance = 0;
@@ -4545,7 +4584,7 @@ function acctPaymentReceiptHTML(p, layout){
       <div class="stmt-note">${p.balanceAfter<=ACCT_EPS?"✔ This payment settles the customer's account in full.":"This is a part-payment. The balance above remains payable."}</div>
       <div class="stmt-code"><svg class="acct-barcode"></svg><span class="acct-qr"></span></div>
       <div class="stmt-sign"><div>Customer's signature</div><div>Received by (${escapeHtml(p.by||"staff")})</div></div>
-      <div class="stmt-foot">${escapeHtml(s.footer||"Thank you for shopping with us!")}<br>This receipt is proof of payment. Please keep it safely.</div>
+      <div class="stmt-foot">${footerHTML(s.footer)}<br>This receipt is proof of payment. Please keep it safely.</div>
     </div>`;
   }
   return `<div class="receipt ${layout}" id="acctDocRoot">
@@ -4569,7 +4608,7 @@ function acctPaymentReceiptHTML(p, layout){
     <div class="r-center"><svg class="acct-barcode"></svg></div>
     <div class="r-center acct-qr" style="margin-top:6px"></div>
     <hr>
-    <div class="r-center">${escapeHtml(s.footer||"Thank you for shopping with us!")}<br><span style="font-size:.85em">Keep this receipt as proof of payment.</span></div>
+    <div class="r-center">${footerHTML(s.footer)}<br><span style="font-size:.85em">Keep this receipt as proof of payment.</span></div>
   </div>`;
 }
 
@@ -4624,7 +4663,7 @@ function acctStatementHTML(acct, range, layout){
     <div class="r-row"><span>Payments</span><span>${money(m.credits)}</span></div>
     <div class="r-row" style="font-weight:700;font-size:1.1em"><span>${settled?"BALANCE":"BALANCE DUE"}</span><span>${money(m.closing)}</span></div>
     ${settled?`<div class="r-center"><b>*** FULLY PAID ***</b></div>`:""}
-    <hr><div class="r-center">${escapeHtml(s.footer||"Thank you for shopping with us!")}</div>
+    <hr><div class="r-center">${footerHTML(s.footer)}</div>
   </div>`;
 }
 
@@ -4702,7 +4741,11 @@ function acctDownloadPaymentPDF(p){
     if(p.balanceAfter<=ACCT_EPS){ pdf.text("*** ACCOUNT FULLY SETTLED ***", 113, y, {align:"center"}); y+=14; }
     if(p.note){ pdf.setFont("courier","normal"); pdf.text(pdf.splitTextToSize("Note: "+p.note, 199), 14, y); y+=24; }
     y+=8; pdf.setFont("courier","normal"); pdf.setFontSize(8);
-    pdf.text(pdf.splitTextToSize(s.footer||"Thank you for shopping with us!", 199), 113, y, {align:"center"}); y+=22;
+    footerLines(s.footer).forEach(l=>{
+      if(!l.trim()){ y+=6; return; }
+      pdf.splitTextToSize(pdfSafeText(l), 199).forEach(w=>{ pdf.text(w, 113, y, {align:"center"}); y+=10; });
+    });
+    y+=6;
     pdf.text("Keep this receipt as proof of payment.", 113, y, {align:"center"});
     pdf.save(`${p.ref}.pdf`);
   }catch(e){ console.error(e); toast("Could not generate PDF in this browser.","err"); }
@@ -4995,13 +5038,6 @@ window.duplicateProduct = async function(id){
   await dataSet("products", copy); state.products.push(copy);
   toast("Product duplicated","ok"); renderProducts();
 };
-window.deleteProduct = function(id){
-  confirmDialog("Delete this product permanently? This cannot be undone.", async ()=>{
-    await dataDelete("products", id);
-    state.products = state.products.filter(p=>p.id!==id);
-    toast("Product deleted","ok"); renderProducts();
-  });
-};
 function exportCSV(rows, filename){
   if(!rows.length) return toast("Nothing to export","warn");
   const headers = Object.keys(rows[0]);
@@ -5077,13 +5113,671 @@ function renderCategories(){
 /* ------------------------------------------------------------------
    23. CUSTOMERS
 ------------------------------------------------------------------ */
+/* ====================================================================
+   SETTINGS SYNC — whatever an Admin changes in Settings reaches every device
+   - Live: a Firestore listener pushes store-info changes to every signed-in device within seconds (no reload).
+   - Safe: a save sends only the fields the Admin actually changed, merged onto the newest cloud copy, so two
+     admins editing different fields never overwrite each other; unsaved typing on an open form is never wiped.
+   - Staff: role / name / deactivation changes reach that person's device live (a deactivated user is signed out).
+   - Honest: the Settings page shows whether sync is live, offline or waiting, and Save says which one happened.
+   - Falls back to checking every minute if live listeners are blocked, and to other tabs on the same device
+     when no cloud is configured.
+   ==================================================================== */
+const SETTINGS_FIELDS = [["stName","name"],["stPhone","phone"],["stAddr","address"],["stFooter","footer"],["stPolicy","returnPolicy"],["stCurr","currency"],["stTax","taxRate"]];
+const SETTINGS_LABELS = { name:"Store name", phone:"Phone", address:"Address", footer:"Receipt footer", returnPolicy:"Return policy", currency:"Currency", taxRate:"Default tax %" };
+const settingsSync = { unsubs:[], live:false, failed:false, poll:null, timer:null, saving:false, baseline:null, channel:null };
+
+function settingFormValue(field, el){
+  if(field==="taxRate") return +el.value || 0;
+  if(field==="currency") return el.value.trim() || "₦";
+  return el.value.trim();
+}
+function readSettingsForm(){
+  const v = {};
+  for(const [id, f] of SETTINGS_FIELDS){ const el = document.getElementById(id); if(el) v[f] = settingFormValue(f, el); }
+  return v;
+}
+function snapshotSettingsBaseline(){ settingsSync.baseline = readSettingsForm(); }
+function staffRowsHTML(list){
+  return list.filter(Boolean).map(st=>`
+        <tr><td class="mono">${escapeHtml(st.username)}</td><td>${escapeHtml(st.name)}</td><td>${escapeHtml(st.role)}</td>
+        <td><span class="pill ${st.active===false?'pill-danger':'pill-ok'}">${st.active===false?'Deactivated':'Active'}</span></td>
+        <td><button class="btn btn-sm btn-ghost" onclick="openEditStaffModal('${escapeHtml(st.username)}')">Edit</button></td></tr>
+      `).join("");
+}
+function refreshStaffRows(){
+  const body = document.getElementById("staffBody"); if(!body) return;
+  Promise.all(USERS.map(u=>effectiveStaffRecord(u.username))).then(list=>{ const b = document.getElementById("staffBody"); if(b) b.innerHTML = staffRowsHTML(list); });
+}
+// Staff profiles live in the cloud; an Admin's device only knew the ones who had signed in on THAT device.
+async function syncStaffProfiles(){
+  if(!FIREBASE_READY || !navigator.onLine || !can("editUsers")) return false;
+  try{ await dataGetAll("users"); return true; }catch(e){ return false; }
+}
+
+async function updateSyncStatus(){
+  const el = document.getElementById("syncStatus");
+  const line = document.getElementById("settingsInfoLine");
+  if(line){
+    const s = state.settings || {};
+    line.textContent = s.updatedAt ? `Last changed${s.updatedBy?" by "+s.updatedBy:""} on ${fmtDate(s.updatedAt)}` : "";
+  }
+  if(!el) return;
+  const q = await idbGetAll("syncQueue").catch(()=>[]);
+  const pending = q.filter(x=>x.collection==="settings" || x.collection==="users").length;
+  let dot, text;
+  if(!FIREBASE_READY){ dot="⚪"; text="This app is running on this device only (no cloud connection is set up), so settings cannot reach other devices."; }
+  else if(!navigator.onLine){ dot="🟡"; text="You are offline — changes are saved on this device and upload automatically when the connection returns."; }
+  else if(settingsSync.failed){ dot="🟠"; text="Live updates are blocked on this connection — this device checks for changes every minute instead."; }
+  else if(settingsSync.live){ dot="🟢"; text="Live sync is on — a change saved here appears on every signed-in device within seconds."; }
+  else { dot="🔵"; text="Connecting to live sync…"; }
+  if(pending) text += ` ${pending} change${pending===1?"":"s"} waiting to upload.`;
+  el.innerHTML = `<span>${dot}</span><span>${text}</span>`;
+}
+
+// A newer copy of the store settings arrived (from another device or tab).
+async function applyRemoteSettings(data, announce){
+  if(!data || data.id!=="store_info") return false;
+  if((data.updatedAt||0) <= ((state.settings && state.settings.updatedAt)||0)) return false; // our own echo / older copy
+  state.settings = Object.assign({}, STORE, data);
+  try{ await idbPut("settings", data); }catch(e){ console.warn("Could not cache settings", e); }
+  // refresh an open Settings form WITHOUT wiping what the Admin is typing: only untouched fields take the new value
+  if(document.getElementById("stName")){
+    const now = readSettingsForm(), base = settingsSync.baseline || {};
+    for(const [id, f] of SETTINGS_FIELDS){
+      const el = document.getElementById(id); if(!el) continue;
+      const edited = (f in base) && now[f] !== base[f];
+      if(!edited){ el.value = state.settings[f]==null ? "" : state.settings[f]; if(settingsSync.baseline) settingsSync.baseline[f] = settingFormValue(f, el); }
+    }
+  }
+  updateSyncStatus();
+  if(state.page==="sales" && !state.cart.length && document.getElementById("taxInput")) renderSales(); // new default tax applies at once
+  if(announce) toast(`Settings updated${data.updatedBy?" by "+data.updatedBy:""} — now live on this device`, "ok", 4500);
+  return true;
+}
+// This signed-in user's own profile changed (role / name / deactivated) — act on it immediately.
+function handleOwnProfileChange(d){
+  if(!state.user || !d) return;
+  if(d.active === false){
+    toast("Your account was deactivated by an Admin. Signing out…", "err", 6000);
+    setTimeout(()=>{ if(state.user) logout(); }, 1500);
+    return;
+  }
+  let changed = false;
+  if(d.role && d.role !== state.user.role && PERMISSIONS[d.role]){ state.user.role = d.role; changed = true; }
+  if(d.name && d.name !== state.user.name){ state.user.name = d.name; changed = true; }
+  if(changed){
+    document.getElementById("userName").textContent = state.user.name;
+    document.getElementById("userRole").textContent = state.user.role;
+    document.getElementById("userAvatar").textContent = state.user.name[0];
+    renderNav();
+    if(!canAccessPage(state.page)) goPage(DEFAULT_PAGE_FOR_ROLE[state.user.role] || "dashboard");
+    toast("Your account details were updated by an Admin", "ok", 4500);
+  }
+}
+async function pullSettingsNow(){
+  if(!FIREBASE_READY || !navigator.onLine) return false;
+  try{
+    const { doc, getDoc } = firestoreApi;
+    const snap = await getDoc(doc(fbDb, "settings", "store_info"));
+    if(snap.exists()) await applyRemoteSettings(snap.data(), true);
+    if(state.user && state.user.uid){
+      const me = await getDoc(doc(fbDb, "users", state.user.uid));
+      if(me.exists()) handleOwnProfileChange(me.data());
+    }
+    if(can("editUsers")){ await syncStaffProfiles(); refreshStaffRows(); }
+    return true;
+  }catch(e){ console.warn("[Sync] Could not check for changes", e); return false; }
+}
+function openSettingsChannel(){
+  try{
+    if(settingsSync.channel || !("BroadcastChannel" in window)) return;
+    settingsSync.channel = new BroadcastChannel("haramos-settings");
+    settingsSync.channel.onmessage = async (ev)=>{
+      if(ev.data && ev.data.type==="settings-changed" && state.user){
+        const rec = await idbGet("settings", "store_info");
+        if(rec) await applyRemoteSettings(rec, true);
+      }
+    };
+  }catch(e){ console.warn("BroadcastChannel unavailable", e); }
+}
+function startSettingsSync(){
+  stopSettingsSync();
+  openSettingsChannel();
+  settingsSync.timer = setInterval(updateSyncStatus, 15000);
+  if(!FIREBASE_READY){ updateSyncStatus(); return; }
+  const api = firestoreApi;
+  const onFail = (what)=> (err)=>{
+    console.warn(`[Sync] ${what} listener unavailable — falling back to periodic checks`, err);
+    settingsSync.failed = true; settingsSync.live = false;
+    if(!settingsSync.poll) settingsSync.poll = setInterval(pullSettingsNow, 60000);
+    updateSyncStatus();
+  };
+  try{
+    let first = true;
+    settingsSync.unsubs.push(api.onSnapshot(api.doc(fbDb, "settings", "store_info"), (snap)=>{
+      settingsSync.live = true; settingsSync.failed = false;
+      if(!(snap.metadata && snap.metadata.hasPendingWrites) && snap.exists()) applyRemoteSettings(snap.data(), !first);
+      first = false; updateSyncStatus();
+    }, onFail("settings")));
+  }catch(e){ onFail("settings")(e); }
+  if(state.user && state.user.uid){
+    try{
+      settingsSync.unsubs.push(api.onSnapshot(api.doc(fbDb, "users", state.user.uid), (snap)=>{
+        if(snap.exists() && !(snap.metadata && snap.metadata.hasPendingWrites)) handleOwnProfileChange(snap.data());
+      }, (err)=>console.warn("[Sync] own-profile listener unavailable", err)));
+    }catch(e){ console.warn(e); }
+  }
+  if(can("editUsers")){
+    try{
+      settingsSync.unsubs.push(api.onSnapshot(api.collection(fbDb, "users"), (snap)=>{
+        const puts = [];
+        snap.docChanges().forEach(ch=>{ if(ch.type!=="removed") puts.push(idbPut("users", ch.doc.data())); });
+        Promise.all(puts).then(refreshStaffRows);
+      }, (err)=>console.warn("[Sync] staff listener unavailable (check Firestore rules for the users collection)", err)));
+    }catch(e){ console.warn(e); }
+  }
+  updateSyncStatus();
+}
+function stopSettingsSync(){
+  settingsSync.unsubs.forEach(u=>{ try{ u(); }catch(e){} });
+  settingsSync.unsubs = []; settingsSync.live = false; settingsSync.failed = false;
+  if(settingsSync.poll){ clearInterval(settingsSync.poll); settingsSync.poll = null; }
+  if(settingsSync.timer){ clearInterval(settingsSync.timer); settingsSync.timer = null; }
+}
+async function logSettingsChange(changed, before){
+  const names = Object.keys(changed).map(f=>SETTINGS_LABELS[f]||f).join(", ");
+  const short = v=>{ const t = String(v==null?"":v).replace(/\s+/g," "); return t.length>60 ? t.slice(0,57)+"…" : t; };
+  const detail = Object.keys(changed).map(f=>`${SETTINGS_LABELS[f]||f}: "${short(before[f])}" → "${short(changed[f])}"`).join(" · ");
+  const entry = { id:"audit_"+Date.now().toString(36)+Math.random().toString(36).slice(2,6), kind:"settings",
+    what:"Settings changed", label:names, detail, by:(state.user&&state.user.name)||"?", at:Date.now() };
+  try{ await dataSet("settings", entry); }catch(e){ console.warn("Could not write settings log", e); }
+}
+async function saveSettingsForm(){
+  if(!can("changeSettings") || settingsSync.saving) return;
+  settingsSync.saving = true;
+  const btn = document.getElementById("stSave"); if(btn) btn.disabled = true;
+  try{
+    const form = readSettingsForm(), base = settingsSync.baseline || {};
+    if(!form.name){ toast("The store name can't be empty","err"); return; }
+    if(!(form.taxRate>=0 && form.taxRate<=100)){ toast("Default tax % must be between 0 and 100","err"); return; }
+    const changed = {};
+    for(const f of Object.keys(form)) if(form[f] !== base[f]) changed[f] = form[f];
+    if(!Object.keys(changed).length){ toast("No changes to save","warn"); return; }
+    // start from the NEWEST copy (cloud if reachable) so another admin's recent edits to other fields are kept
+    let latest = state.settings;
+    if(FIREBASE_READY && navigator.onLine){
+      try{
+        const { doc, getDoc } = firestoreApi;
+        const snap = await getDoc(doc(fbDb, "settings", "store_info"));
+        if(snap.exists() && (snap.data().updatedAt||0) > (latest.updatedAt||0)) latest = snap.data();
+      }catch(e){ console.warn("Could not read newest settings before saving", e); }
+    }
+    const before = {}; for(const f of Object.keys(changed)) before[f] = latest[f];
+    const updated = Object.assign({}, latest, changed, { id:"store_info", updatedBy:state.user.name });
+    await dataSet("settings", updated);
+    state.settings = updated;
+    for(const [id, f] of SETTINGS_FIELDS){ const el = document.getElementById(id); if(el) el.value = updated[f]==null ? "" : updated[f]; }
+    snapshotSettingsBaseline();
+    try{ if(settingsSync.channel) settingsSync.channel.postMessage({ type:"settings-changed", at:updated.updatedAt }); }catch(e){}
+    await logSettingsChange(changed, before);
+    const queued = (await idbGetAll("syncQueue").catch(()=>[])).some(q=>q.collection==="settings" && q.obj && q.obj.id==="store_info");
+    toast(queued ? "Saved on this device — it will reach your other devices as soon as you are online"
+                 : (FIREBASE_READY ? "Settings saved and synced to all devices ✓" : "Settings saved on this device"), queued?"warn":"ok", 5000);
+  } finally {
+    settingsSync.saving = false;
+    const b = document.getElementById("stSave"); if(b) b.disabled = false;
+    updateSyncStatus();
+  }
+}
+async function syncNow(){
+  const btn = document.getElementById("syncNowBtn"); if(btn) btn.disabled = true;
+  try{
+    await flushSyncQueue();
+    const ok = await pullSettingsNow();
+    toast(ok ? "Everything is up to date ✓" : (FIREBASE_READY ? "Could not reach the cloud — it will retry automatically" : "No cloud connection is set up on this app"), ok?"ok":"warn");
+  } finally { if(btn) btn.disabled = false; updateSyncStatus(); }
+}
+
+/* ====================================================================
+   ADMIN DELETE TOOLS
+   Every deletion: Admin only -> shows exactly what it will affect -> asks for confirmation (customers: type DELETE)
+   -> cleans up everything linked to the record -> is written to the Deletion Log.
+   ==================================================================== */
+async function logDeletion(what, label, detail){
+  const entry = { id:"audit_"+Date.now().toString(36)+Math.random().toString(36).slice(2,6), kind:"deletion",
+    what, label, detail:detail||"", by:(state.user&&state.user.name)||"?", at:Date.now() };
+  try{ await dataSet("settings", entry); }catch(e){ console.warn("Could not write deletion log", e); }
+}
+function openDeleteDialog({ title, intro, facts=[], options=[], typeToConfirm=null, confirmLabel="Delete permanently", onConfirm }){
+  const optHtml = options.map(o=>`<label style="display:flex;gap:8px;align-items:flex-start;margin:9px 0;font-size:13px;${o.disabled?"opacity:.55":""}">
+    <input type="checkbox" class="delOpt" data-id="${o.id}" ${o.checked?"checked":""} ${o.disabled?"disabled":""} style="margin-top:3px">
+    <span>${o.label}${o.hint?`<br><span style="color:var(--ink-soft);font-size:12px">${o.hint}</span>`:""}</span></label>`).join("");
+  openModal(`<div class="modal-head"><h3>🗑️ ${title}</h3><button class="close-x" onclick="window.__closeModal()">✕</button></div>
+  <div class="modal-body">
+    <p style="font-size:13px;margin-bottom:10px">${intro}</p>
+    ${facts.length?`<div class="card" style="padding:10px 12px;margin-bottom:10px">${facts.map(f=>`<div style="display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:2px 0"><span style="color:var(--ink-soft)">${f[0]}</span><b style="text-align:right">${f[1]}</b></div>`).join("")}</div>`:""}
+    ${optHtml}
+    ${typeToConfirm?`<div class="field" style="margin-top:12px"><label>Type <b>${typeToConfirm}</b> to confirm</label><input id="delTypeBox" autocomplete="off" placeholder="${typeToConfirm}"></div>`:""}
+    <p style="font-size:12px;color:var(--danger);margin-top:12px">This cannot be undone. If you are unsure, download a backup first (Settings → Backup).</p>
+  </div>
+  <div class="modal-foot"><button class="btn btn-ghost" onclick="window.__closeModal()">Cancel</button><button class="btn btn-danger" id="delGo">${confirmLabel}</button></div>`);
+  let busy = false;
+  document.getElementById("delGo").onclick = async ()=>{
+    if(busy) return;
+    if(typeToConfirm && String(document.getElementById("delTypeBox").value||"").trim().toUpperCase() !== String(typeToConfirm).toUpperCase()){
+      toast(`Type ${typeToConfirm} exactly to confirm`, "err"); return;
+    }
+    busy = true; const btn = document.getElementById("delGo"); btn.disabled = true;
+    const opts = {}; document.querySelectorAll(".delOpt").forEach(c=>{ opts[c.dataset.id] = c.checked; });
+    try{ await onConfirm(opts); }
+    catch(e){ console.error(e); toast("The delete did not finish: "+((e&&e.message)||e), "err", 7000); busy = false; btn.disabled = false; return; }
+    closeModal();
+  };
+}
+function requireDeleteRights(){ if(!can("deleteRecords")){ toast("Only an Admin can delete records.", "err"); return false; } return true; }
+// Redraw whatever screen is open so the deleted record disappears straight away.
+function refreshViews(){
+  try{
+    if(window.__dmDraw && document.getElementById("dmBody")) window.__dmDraw();
+    const pg = state.page;
+    if(pg==="credit" && document.getElementById("creditTabBody")) drawCreditTab(window.__creditTab||"debts");
+    else if(pg==="receipts") renderReceipts();
+    else if(pg==="customers") renderCustomers();
+    else if(pg==="suppliers") renderSuppliers();
+    else if(pg==="expenses") renderExpenses();
+    else if(pg==="returns") renderReturnsPage();
+    else if(pg==="products") renderProducts();
+    else if(pg==="inventory") renderInventory();
+    else if(pg==="dashboard") goPage("dashboard");
+  }catch(e){ console.warn("refreshViews", e); }
+}
+const outstandingGoods = adv => (adv.products||[]).reduce((a,p)=>a+Math.max(0,(p.reserved||0)-(p.collected||0)),0);
+
+/* ---------- Advance payments (any kind: standalone, from a sale, pick-up record, deposit, store credit) ---------- */
+async function performDeleteAdvance(adv, o={}){
+  // Goods are only returned to stock for standalone advances. Advances/pick-ups that belong to a sale: the sale itself
+  // already deducted that stock, and deleting the receipt later restores it — doing it here too would count it twice.
+  const canRestock = !adv.saleId && !adv.pickupOnly;
+  if(o.restock && canRestock){
+    for(const p of (adv.products||[])){
+      const outstanding = Math.max(0, (p.reserved||0) - (p.collected||0));
+      if(outstanding<=0) continue;
+      const product = advProduct(p);
+      if(!product) continue;
+      const restore = stockDeductionFor(product, p.unit, outstanding);
+      product.currentStock = +(product.currentStock + restore).toFixed(4);
+      await dataSet("products", product);
+      await dataSet("stockHistory", { id:genId("stk"), productId:product.id, productName:product.name,
+        type:"Advance deleted (restock)", change:restore, reference:adv.receiptNumber, createdAt:Date.now(), by:state.user.name });
+    }
+  }
+  for(const d of state.debts.filter(x=>x.advanceId===adv.id)) await dataDelete("debts", d.id);
+  state.debts = state.debts.filter(d=>d.advanceId!==adv.id);
+  if(o.ledger){ for(const p of state.payments.filter(x=>x.advanceId===adv.id)) await dataDelete("payments", p.id); }
+  await dataDelete("advancePayments", adv.id);
+  state.advances = state.advances.filter(a=>a.id!==adv.id);
+  await logDeletion("Advance payment", `${adv.customerName} — ${adv.receiptNumber}`,
+    `Paid ${money(adv.amountPaid)}, store credit ${money(adv.creditBalance||0)}${o.restock&&canRestock?", unclaimed goods returned to stock":""}`);
+}
+window.deleteAdvance = function(id){
+  if(!requireDeleteRights()) return;
+  const adv = state.advances.find(a=>a.id===id); if(!adv) return;
+  const sale = adv.saleId ? state.sales.find(x=>x.id===adv.saleId) : null;
+  const out = outstandingGoods(adv), canRestock = !adv.saleId && !adv.pickupOnly && out>0.0001;
+  const linkedDebt = state.debts.find(d=>d.advanceId===adv.id);
+  const hasLedger = state.payments.some(p=>p.advanceId===adv.id);
+  openDeleteDialog({
+    title:`Delete advance payment`,
+    intro: sale
+      ? `This record belongs to receipt <b>${escapeHtml(sale.receiptNumber)}</b>. Only the advance/pick-up record is removed — the receipt itself stays in Receipt History. To remove the sale too (and return its goods to stock), delete the receipt instead.`
+      : "The advance record is removed from the customer's account. Their store credit from it disappears and any auto-created debt for goods collected beyond the amount paid is removed with it.",
+    facts:[["Customer", escapeHtml(adv.customerName)],["Receipt #", escapeHtml(adv.receiptNumber||"—")],["Amount paid", money(adv.amountPaid)],
+      ["Store credit it holds", money(adv.creditBalance||0)],["Goods not yet collected", out>0.0001?fmtQty(out):"none"],
+      ...(linkedDebt?[["Linked debt (owing)", money(linkedDebt.balance)]]:[])],
+    options:[
+      { id:"restock", label:"Return the uncollected goods to stock", checked:canRestock, disabled:!canRestock,
+        hint: canRestock ? "Tick if the goods are still in the shop and no longer reserved for this customer." : (adv.saleId||adv.pickupOnly ? "Not available here — stock was already taken off by the sale. Deleting the receipt restores it." : "Nothing is waiting to be collected.") },
+      { id:"ledger", label:"Also remove its payment entries from the Payments ledger", checked:false, disabled:!hasLedger,
+        hint: hasLedger ? "Tick only if the record was entered by mistake, so your cash reports stay correct. Leave unticked if the money really was received." : "There are no ledger entries for this record." }
+    ],
+    confirmLabel:"Delete advance payment",
+    onConfirm: async (o)=>{ await performDeleteAdvance(adv, { restock:!!o.restock, ledger:!!o.ledger }); toast("Advance payment deleted","ok"); refreshViews(); }
+  });
+};
+window.deleteManualAdvance = window.deleteAdvance; // old name, kept so nothing breaks
+
+/* ---------- Credit / debt records ---------- */
+async function performDeleteDebt(debt, o={}){
+  if(debt.saleId && debt.balance>0.009){
+    const ls = state.sales.find(x=>x.id===debt.saleId);
+    if(ls){
+      ls.balance = 0; ls.status = "Balance removed"; ls.balanceRemoved = { by:state.user.name, at:Date.now(), amount:debt.balance };
+      await dataSet("sales", ls); await dataSet("receipts", { id:ls.id, ...ls });
+      const rx = state.receipts.findIndex(r=>r.id===ls.id); if(rx>-1) state.receipts[rx] = { id:ls.id, ...ls };
+    }
+  }
+  if(o.ledger){ for(const p of state.payments.filter(x=>x.debtId===debt.id)) await dataDelete("payments", p.id); }
+  await dataDelete("debts", debt.id);
+  state.debts = state.debts.filter(d=>d.id!==debt.id);
+  await logDeletion("Credit / debt record", `${debt.customerName} — ${debt.receiptNumber}`, `Total ${money(debt.total)}, paid ${money(debt.amountPaid)}, owing ${money(debt.balance)}`);
+}
+window.deleteDebtRecord = function(id){
+  if(!requireDeleteRights()) return;
+  const debt = state.debts.find(d=>d.id===id); if(!debt) return;
+  const sale = debt.saleId ? state.sales.find(x=>x.id===debt.saleId) : null;
+  const hasLedger = state.payments.some(p=>p.debtId===id);
+  openDeleteDialog({
+    title:"Delete credit record",
+    intro: (sale ? `This debt came from receipt <b>${escapeHtml(sale.receiptNumber)}</b>. The receipt stays, but its unpaid balance is set to ₦0 so the two agree. ` : "") +
+      (debt.advanceId ? "It was created automatically from an Advance Payment; it can reappear if that advance is edited again with goods collected beyond what was paid. " : "") +
+      "The customer will no longer owe this amount.",
+    facts:[["Customer", escapeHtml(debt.customerName)],["Receipt #", escapeHtml(debt.receiptNumber||"—")],["Total", money(debt.total)],["Paid so far", money(debt.amountPaid)],["Still owing", money(debt.balance)]],
+    options:[{ id:"ledger", label:"Also remove its payments from the Payments ledger", checked:false, disabled:!hasLedger,
+      hint: hasLedger ? "Tick only if the record was entered by mistake. Leave unticked if the customer really did pay." : "There are no ledger entries for this record." }],
+    confirmLabel:"Delete credit record",
+    onConfirm: async (o)=>{ await performDeleteDebt(debt, { ledger:!!o.ledger }); toast("Credit record deleted","ok"); refreshViews(); }
+  });
+};
+window.deleteManualDebt = window.deleteDebtRecord;
+
+/* ---------- Customer account ---------- */
+window.deleteCustomer = function(id){
+  if(!requireDeleteRights()) return;
+  const c = state.customers.find(x=>x.id===id); if(!c) return;
+  const sales = state.sales.filter(s=>s.customerId===id), debts = state.debts.filter(d=>d.customerId===id), advs = state.advances.filter(a=>a.customerId===id);
+  const owing = debts.reduce((a,d)=>a+Math.max(0,d.balance||0),0), credit = customerStoreCredit(id);
+  const standaloneOut = advs.filter(a=>!a.saleId && !a.pickupOnly && outstandingGoods(a)>0.0001).length;
+  openDeleteDialog({
+    title:`Delete customer account`,
+    intro:`<b>${escapeHtml(c.name)}</b>${c.phone?" — "+escapeHtml(c.phone):""}. The profile is removed. Choose what happens to their records below. Sales and receipts are kept for your reports by default (they stay under the name, no longer linked to a profile).`,
+    facts:[["Sales / receipts", String(sales.length)],["Credit / debt records", `${debts.length} (owing ${money(owing)})`],["Advance records", `${advs.length} (store credit ${money(credit)})`]],
+    options:[
+      { id:"delDebts", label:`Delete their ${debts.length} credit/debt record(s) — owing ${money(owing)}`, checked:debts.length>0, disabled:!debts.length, hint:"Untick to keep them listed under the customer's name only." },
+      { id:"delAdv", label:`Delete their ${advs.length} advance record(s) — store credit ${money(credit)}`, checked:advs.length>0, disabled:!advs.length, hint:"Untick to keep them listed under the customer's name only." },
+      { id:"restock", label:"Return uncollected goods from their standalone advances to stock", checked:standaloneOut>0, disabled:standaloneOut===0, hint: standaloneOut ? `${standaloneOut} advance(s) still have goods waiting.` : "No standalone advance has goods waiting." },
+      { id:"delSales", label:`ALSO delete all ${sales.length} of their sales/receipts and put the goods back in stock`, checked:false, disabled:!sales.length, hint:"Removes them from every report. Leave unticked to keep your sales history." },
+      { id:"ledger", label:"Also remove their payment entries from the Payments ledger", checked:false, hint:"Leave unticked to keep cash reports unchanged." }
+    ],
+    typeToConfirm:"DELETE", confirmLabel:"Delete customer account",
+    onConfirm: async (o)=>{
+      if(o.delSales){ for(const sl of state.sales.filter(x=>x.customerId===id)) await performDeleteSale(sl, { quiet:true }); }
+      if(o.delAdv){ for(const a of state.advances.filter(x=>x.customerId===id)) await performDeleteAdvance(a, { restock:!!o.restock, ledger:!!o.ledger }); }
+      if(o.delDebts){ for(const d of state.debts.filter(x=>x.customerId===id)) await performDeleteDebt(d, { ledger:!!o.ledger }); }
+      // whatever is kept stays under the customer's NAME but no longer points at the deleted profile
+      for(const [col, arr] of [["sales",state.sales],["receipts",state.receipts],["debts",state.debts],["advancePayments",state.advances],["returns",state.returns],["payments",state.payments]]){
+        for(const r of arr){ if(r.customerId===id){ r.customerId = null; await dataSet(col, r); } }
+      }
+      for(const h of await idbGetAll("heldSales")){ if(h.customer && h.customer.id===id){ h.customer = null; await idbPut("heldSales", h); } }
+      await dataDelete("customers", id);
+      state.customers = state.customers.filter(x=>x.id!==id);
+      if(state.activeCustomer && state.activeCustomer.id===id){ state.activeCustomer = null; }
+      await logDeletion("Customer account", `${c.name}${c.phone?" — "+c.phone:""}`,
+        `Sales ${o.delSales?"deleted":"kept"} (${sales.length}); credit records ${o.delDebts?"deleted":"kept"} (${debts.length}); advances ${o.delAdv?"deleted":"kept"} (${advs.length})`);
+      toast(`${c.name}'s account deleted`, "ok"); refreshViews();
+    }
+  });
+};
+
+/* ---------- Returns ---------- */
+window.deleteReturnRecord = function(id){
+  if(!requireDeleteRights()) return;
+  const r = state.returns.find(x=>x.id===id); if(!r) return;
+  openDeleteDialog({
+    title:`Delete return on ${escapeHtml(r.receiptNumber)}`,
+    intro:"The return record is removed and the original receipt goes back to showing those goods as kept. Choose what else to undo.",
+    facts:[["Customer", escapeHtml(r.customerName||"Walk-in")],["Date", fmtDate(r.createdAt)],["Items", escapeHtml(r.items.map(i=>`${fmtQty(i.qty)} ${i.unit} ${i.productName}`).join(", "))],["Refund", `${money(r.totalRefund)} (${escapeHtml(r.refundMethod)})`]],
+    options:[
+      { id:"stock", label:"Take the returned goods back out of stock", checked:true, hint:"Undoes the restock this return did." },
+      { id:"refund", label:`Reverse the ${escapeHtml(r.refundMethod)} refund`, checked:true,
+        hint:"Cash: removes the refund from the Payments ledger. Store Credit: removes that credit. Reduce Balance: puts the amount back on the customer's debt." }
+    ],
+    confirmLabel:"Delete return record",
+    onConfirm: async (o)=>{
+      const notes = [];
+      if(o.stock){
+        for(const item of r.items){
+          if(item.isCustom) continue;
+          const product = (item.productId && state.products.find(p=>p.id===item.productId)) || state.products.find(p=>p.name===item.productName);
+          if(!product) continue;
+          const take = stockDeductionFor(product, item.unit, item.qty);
+          product.currentStock = Math.max(0, +(product.currentStock - take).toFixed(4));
+          await dataSet("products", product);
+          await dataSet("stockHistory", { id:genId("stk"), productId:product.id, productName:product.name, type:"Return deleted (stock reversed)", change:-take, reference:r.receiptNumber, createdAt:Date.now(), by:state.user.name });
+        }
+      }
+      if(o.refund){
+        let done = false;
+        if(r.refundMethod==="Store Credit"){
+          const adv = state.advances.find(a=>!a.saleId && String(a.notes||"")===`Store credit from return on ${r.receiptNumber}` && Math.abs((a.amountPaid||0)-r.totalRefund)<0.01);
+          if(adv){ done = true;
+            if((adv.creditUsed||0)>0.009){ adv.creditBalance = 0; await dataSet("advancePayments", adv); notes.push("part of that credit was already spent"); }
+            else { await dataDelete("advancePayments", adv.id); state.advances = state.advances.filter(a=>a.id!==adv.id); } }
+        } else if(r.refundMethod==="Reduce Balance"){
+          const debt = state.debts.find(d=>d.saleId===r.saleId);
+          const idx = debt ? (debt.history||[]).findIndex(h=>h.note===`Return credit — ${r.receiptNumber}`) : -1;
+          if(debt && idx>-1){
+            const amt = debt.history[idx].amount||0;
+            debt.balance = r2(debt.balance + amt); debt.history.splice(idx,1);
+            await dataSet("debts", debt);
+            const ls = state.sales.find(x=>x.id===debt.saleId);
+            if(ls){ ls.balance = debt.balance; ls.status = debt.balance<=0.009?"Paid":"Partial/Owing"; await dataSet("sales", ls); await dataSet("receipts", { id:ls.id, ...ls });
+              const rx = state.receipts.findIndex(x=>x.id===ls.id); if(rx>-1) state.receipts[rx] = { id:ls.id, ...ls }; }
+            done = true;
+          }
+          const ex = state.advances.find(a=>!a.saleId && String(a.notes||"")===`Store credit — return refund exceeded the balance owed on ${r.receiptNumber}`);
+          if(ex){ await dataDelete("advancePayments", ex.id); state.advances = state.advances.filter(a=>a.id!==ex.id); done = true; }
+        } else {
+          const cand = state.payments.filter(p=>p.type==="refund" && p.saleId===r.saleId && Math.abs((p.amount||0)-r.totalRefund)<0.01)
+            .sort((a,b)=>Math.abs((a.createdAt||0)-r.createdAt)-Math.abs((b.createdAt||0)-r.createdAt))[0];
+          if(cand){ await dataDelete("payments", cand.id); done = true; }
+        }
+        if(!done) notes.push("the refund entry could not be found automatically — adjust it by hand if needed");
+      }
+      await dataDelete("returns", r.id);
+      state.returns = state.returns.filter(x=>x.id!==r.id);
+      await logDeletion("Return", `${r.receiptNumber} — ${r.customerName||"Walk-in"}`, `Refund ${money(r.totalRefund)} (${r.refundMethod}); stock ${o.stock?"reversed":"left as is"}`);
+      toast("Return record deleted"+(notes.length?" — "+notes.join("; "):""), notes.length?"warn":"ok", notes.length?7000:3500); refreshViews();
+    }
+  });
+};
+
+/* ---------- Expenses, suppliers, products, ledger lines ---------- */
+window.deleteExpense = function(id){
+  if(!requireDeleteRights()) return;
+  const e = state.expenses.find(x=>x.id===id); if(!e) return;
+  openDeleteDialog({ title:"Delete expense", intro:"This expense is removed from the Expenses list and from your reports.",
+    facts:[["Category", escapeHtml(e.category)],["Amount", money(e.amount)],["Date", fmtDate(e.createdAt)],["Notes", escapeHtml(e.notes||"—")]], confirmLabel:"Delete expense",
+    onConfirm: async ()=>{ await dataDelete("expenses", id); state.expenses = state.expenses.filter(x=>x.id!==id);
+      await logDeletion("Expense", `${e.category} — ${money(e.amount)}`, e.notes||""); toast("Expense deleted","ok"); refreshViews(); } });
+};
+window.deleteSupplier = function(id){
+  if(!requireDeleteRights()) return;
+  const sp = state.suppliers.find(x=>x.id===id); if(!sp) return;
+  const hasLedger = state.payments.some(p=>p.supplierId===id);
+  openDeleteDialog({ title:"Delete supplier", intro:"The supplier and their purchase/payment history are removed.",
+    facts:[["Name", escapeHtml(sp.name)],["Phone", escapeHtml(sp.phone||"—")],["Outstanding balance", money(sp.balance||0)],["History entries", String((sp.history||[]).length)]],
+    options:[{ id:"ledger", label:"Also remove their payments from the Payments ledger", checked:false, disabled:!hasLedger, hint: hasLedger ? "Leave unticked to keep cash reports unchanged." : "No payments recorded." }],
+    confirmLabel:"Delete supplier",
+    onConfirm: async (o)=>{
+      if(o.ledger){ for(const p of state.payments.filter(x=>x.supplierId===id)) await dataDelete("payments", p.id); }
+      await dataDelete("suppliers", id); state.suppliers = state.suppliers.filter(x=>x.id!==id);
+      await logDeletion("Supplier", sp.name, `Balance ${money(sp.balance||0)}`); toast("Supplier deleted","ok"); refreshViews(); } });
+};
+window.deleteProduct = function(id){
+  if(!can("deleteProducts")){ toast("Only an Admin can delete products.","err"); return; }
+  const p = state.products.find(x=>x.id===id); if(!p) return;
+  const soldIn = state.sales.filter(s=>s.items.some(i=>i.productId===id)).length;
+  const reserved = state.advances.filter(a=>(a.products||[]).some(x=>x.productId===id && x.reserved-x.collected>0.0001)).length;
+  openDeleteDialog({ title:"Delete product", intro:"The product leaves the catalogue and the Sales screen. Past receipts keep its name and prices.",
+    facts:[["Product", escapeHtml(p.name)],["Stock on hand", `${fmtQty(p.currentStock)} ${escapeHtml(p.stockUnit)}`],["Appears in sales", String(soldIn)],["Advances still waiting for it", String(reserved)]], confirmLabel:"Delete product",
+    onConfirm: async ()=>{ await dataDelete("products", id); state.products = state.products.filter(x=>x.id!==id);
+      await logDeletion("Product", p.name, `Stock ${fmtQty(p.currentStock)} ${p.stockUnit}`); toast("Product deleted","ok"); refreshViews(); } });
+};
+window.deleteLedgerEntry = function(collection, id){
+  if(!requireDeleteRights()) return;
+  const isStock = collection==="stockHistory";
+  openDeleteDialog({ title: isStock ? "Delete stock history entry" : "Delete payments ledger entry",
+    intro: isStock ? "Only this line of the history is removed. The product's stock quantity does NOT change." : "Only this ledger line is removed. Customer balances, debts and receipts do NOT change.",
+    confirmLabel:"Delete entry",
+    onConfirm: async ()=>{
+      let label = id;
+      if(isStock){ const h = (await idbGetAll("stockHistory")).find(x=>x.id===id); if(h) label = `${h.productName} ${h.change>0?"+":""}${fmtQty(h.change)} (${h.type})`; }
+      else { const p = state.payments.find(x=>x.id===id); if(p) label = `${p.type} ${money(p.amount)} ${p.method||""} ${p.receiptNumber||""}`; }
+      await dataDelete(collection, id);
+      await logDeletion(isStock?"Stock history entry":"Payments ledger entry", label, "");
+      toast("Entry deleted","ok"); refreshViews(); } });
+};
+
+/* ---------- Data Manager (Settings) ---------- */
+function initDataManager(){
+  const body = document.getElementById("dmBody"); if(!body) return;
+  const typeSel = document.getElementById("dmType"), q = document.getElementById("dmSearch");
+  const custName = id=>{ const c = state.customers.find(x=>x.id===id); return c?c.name:""; };
+  const TYPES = {
+    customers: { rows:()=>state.customers.map(c=>({ id:c.id, title:c.name, sub:`${c.phone||"no phone"} · owes ${money(customerDebit(c))} · credit ${money(customerStoreCredit(c.id))}` })), del:deleteCustomer },
+    advances:  { rows:()=>[...state.advances].sort((a,b)=>b.createdAt-a.createdAt).map(a=>({ id:a.id, title:`${a.customerName} — ${a.receiptNumber}`, sub:`paid ${money(a.amountPaid)} · credit ${money(a.creditBalance||0)} · ${a.collectionStatus}${a.pickupOnly?" · pick-up":""}`, date:a.createdAt })), del:deleteAdvance },
+    debts:     { rows:()=>[...state.debts].sort((a,b)=>b.createdAt-a.createdAt).map(d=>({ id:d.id, title:`${d.customerName} — ${d.receiptNumber}`, sub:`total ${money(d.total)} · owing ${money(d.balance)}`, date:d.createdAt })), del:deleteDebtRecord },
+    sales:     { rows:()=>[...state.sales].sort((a,b)=>b.createdAt-a.createdAt).map(s=>({ id:s.id, title:`${s.receiptNumber} — ${s.customerName||"Walk-in"}`, sub:`${money(s.total)} · ${s.items.length} item(s) · ${s.paymentMethod}`, date:s.createdAt })), del:deleteSale },
+    returns:   { rows:()=>[...state.returns].sort((a,b)=>b.createdAt-a.createdAt).map(r=>({ id:r.id, title:`${r.receiptNumber} — ${r.customerName||"Walk-in"}`, sub:`refund ${money(r.totalRefund)} (${r.refundMethod})`, date:r.createdAt })), del:deleteReturnRecord },
+    products:  { rows:()=>state.products.map(p=>({ id:p.id, title:p.name, sub:`${fmtQty(p.currentStock)} ${p.stockUnit} · ${money(p.sellingPrice)}` })), del:deleteProduct },
+    suppliers: { rows:()=>state.suppliers.map(x=>({ id:x.id, title:x.name, sub:`owed ${money(x.balance||0)}` })), del:deleteSupplier },
+    expenses:  { rows:()=>[...state.expenses].sort((a,b)=>b.createdAt-a.createdAt).map(e=>({ id:e.id, title:`${e.category} — ${money(e.amount)}`, sub:e.notes||"", date:e.createdAt })), del:deleteExpense },
+    stockHistory:{ rows:async()=>(await dataGetAll("stockHistory")).sort((a,b)=>b.createdAt-a.createdAt).map(h=>({ id:h.id, title:`${h.productName} ${h.change>0?"+":""}${fmtQty(h.change)}`, sub:`${h.type} · ${h.reference||""}`, date:h.createdAt })), del:(id)=>deleteLedgerEntry("stockHistory", id) },
+    payments:  { rows:()=>[...state.payments].sort((a,b)=>b.createdAt-a.createdAt).map(p=>({ id:p.id, title:`${p.type} — ${money(p.amount)}`, sub:`${p.method||""} ${p.receiptNumber||""} ${custName(p.customerId)}`.trim(), date:p.createdAt })), del:(id)=>deleteLedgerEntry("payments", id) },
+    log:       { rows:async()=>(await dataGetAll("settings")).filter(x=>String(x.id).startsWith("audit_")).sort((a,b)=>b.at-a.at).map(l=>({ id:l.id, title:`${l.what}: ${l.label}`, sub:`${l.detail||""} · by ${l.by}`, date:l.at })), del:null }
+  };
+  const draw = async ()=>{
+    const t = TYPES[typeSel.value]; const term = q.value.trim().toLowerCase();
+    let rows = await t.rows();
+    rows = rows.filter(r=>!term || `${r.title} ${r.sub}`.toLowerCase().includes(term));
+    const total = rows.length; rows = rows.slice(0,200);
+    body.innerHTML = rows.length
+      ? rows.map(r=>`<tr><td><b>${escapeHtml(r.title)}</b></td><td>${escapeHtml(r.sub||"")}</td><td>${r.date?fmtDate(r.date):"—"}</td>
+          <td class="row-actions">${t.del?`<button class="icon-sm dmDel" data-id="${escapeHtml(r.id)}" title="Delete">🗑️</button>`:""}</td></tr>`).join("")
+        + (total>200?`<tr><td colspan="4" style="color:var(--ink-soft)">Showing 200 of ${total} — use the search box to narrow it down.</td></tr>`:"")
+      : `<tr><td colspan="4"><div class="empty-state"><div class="ic">🗂️</div>Nothing here</div></td></tr>`;
+    body.querySelectorAll(".dmDel").forEach(b=> b.addEventListener("click", ()=> t.del(b.dataset.id)));
+  };
+  window.__dmDraw = draw;
+  typeSel.addEventListener("change", draw); q.addEventListener("input", draw);
+  draw();
+}
+
+/* ---- One profile per customer ----
+   Names are compared ignoring capitals, extra spaces, punctuation and accents; phone numbers are compared by their
+   national digits, so 0803 123 4567, 08031234567 and +234 803 123 4567 are the same number. */
+function normName(x){ return String(x||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/[^a-z0-9]+/g," ").trim(); }
+function normPhone(x){
+  let d = String(x||"").replace(/\D/g,"");
+  if(d.startsWith("234") && d.length>=12) d = d.slice(3); else if(d.startsWith("0")) d = d.slice(1);
+  return d;
+}
+// Do two {name, phone} describe the same person?
+function sameCustomerProfile(a, b){
+  const na = normName(a.name), nb = normName(b.name), pa = normPhone(a.phone), pb = normPhone(b.phone);
+  const phoneSame = pa.length>=7 && pb.length>=7 && pa===pb;
+  if(phoneSame) return !na || !nb || na===nb || na.includes(nb) || nb.includes(na); // same phone: same person unless the names clearly differ
+  if(!na || na!==nb) return false;
+  return !pa || !pb || pa===pb;                                                      // same name: same person unless the phones differ
+}
+function findCustomerMatch(name, phone, excludeId){
+  return state.customers.find(c=>c.id!==excludeId && sameCustomerProfile(c, { name, phone })) || null;
+}
+// Used by every screen that can type a customer's name: reuse the existing profile, never create a second one.
+async function resolveCustomer(name, phone){
+  const found = findCustomerMatch(name, phone, null);
+  if(found){
+    if(!found.phone && phone){ found.phone = phone; await dataSet("customers", found); }
+    return found;
+  }
+  const created = { id:genId("cust"), name:String(name).trim(), phone:String(phone||"").trim(), address:"", notes:"" };
+  await dataSet("customers", created); state.customers.push(created);
+  return created;
+}
+// Groups of profiles that are really one customer (union of every matching pair).
+function findDuplicateCustomerGroups(){
+  const list = state.customers, parent = list.map((_,i)=>i);
+  const find = i=>{ while(parent[i]!==i){ parent[i]=parent[parent[i]]; i=parent[i]; } return i; };
+  for(let i=0;i<list.length;i++) for(let j=i+1;j<list.length;j++) if(sameCustomerProfile(list[i], list[j])) parent[find(i)] = find(j);
+  const groups = {};
+  list.forEach((c,i)=>{ (groups[find(i)] = groups[find(i)] || []).push(c); });
+  return Object.values(groups).filter(g=>g.length>1);
+}
+// Credit / advance records that were never attached to a profile (older data) — find the profile they belong to.
+function findUnlinkedAccountRecords(){
+  return [...state.debts.map(r=>({ col:"debts", r })), ...state.advances.map(r=>({ col:"advancePayments", r }))]
+    .filter(x=>!x.r.customerId && String(x.r.customerName||"").trim());
+}
+async function mergeCustomerGroup(group){
+  const linked = c=>[state.sales, state.debts, state.advances].reduce((n,arr)=>n+arr.filter(r=>r.customerId===c.id).length,0);
+  const score = c=> (c.phone?1000:0) + (c.address?100:0) + linked(c);
+  const sorted = [...group].sort((a,b)=>score(b)-score(a));
+  const keep = sorted[0], drops = sorted.slice(1), dropIds = new Set(drops.map(d=>d.id));
+  for(const d of drops){
+    if(!keep.phone && d.phone) keep.phone = d.phone;
+    if(!keep.address && d.address) keep.address = d.address;
+    if(d.notes && !String(keep.notes||"").includes(d.notes)) keep.notes = [keep.notes, d.notes].filter(Boolean).join(" | ");
+  }
+  await dataSet("customers", keep);
+  let moved = 0;
+  for(const [col, arr] of [["sales",state.sales],["receipts",state.receipts],["debts",state.debts],["advancePayments",state.advances],["returns",state.returns],["payments",state.payments]]){
+    for(const r of arr){
+      if(r.customerId && dropIds.has(r.customerId)){
+        r.customerId = keep.id;
+        if("customerName" in r) r.customerName = keep.name;
+        if(col==="debts" || col==="advancePayments") r.phone = r.phone || keep.phone || "";
+        await dataSet(col, r); moved++;
+      }
+    }
+  }
+  for(const h of await idbGetAll("heldSales")){ if(h.customer && dropIds.has(h.customer.id)){ h.customer = keep; await idbPut("heldSales", h); } }
+  for(const d of drops) await dataDelete("customers", d.id);
+  state.customers = state.customers.filter(c=>!dropIds.has(c.id));
+  if(state.activeCustomer && dropIds.has(state.activeCustomer.id)) state.activeCustomer = keep;
+  return { keep, merged:drops.length, moved };
+}
+window.openMergeDuplicatesModal = function(){
+  if(!can("changeSettings")){ toast("Only Admin can merge customer profiles.","err"); return; }
+  const groups = findDuplicateCustomerGroups(), orphans = findUnlinkedAccountRecords();
+  const recCount = c=> state.sales.filter(x=>x.customerId===c.id).length + state.debts.filter(x=>x.customerId===c.id).length + state.advances.filter(x=>x.customerId===c.id).length;
+  openModal(`<div class="modal-head"><h3>Merge duplicate customers</h3><button class="close-x" onclick="window.__closeModal()">✕</button></div>
+  <div class="modal-body">
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:10px">Each group below is the same customer saved more than once. They will be combined into <b>one profile</b>:
+    all sales, receipts, debts, advances and store credit move to it, and the extra profiles are removed. Nothing is lost.</p>
+    ${groups.length ? groups.map(g=>`<div class="card" style="padding:10px;margin-bottom:8px">${g.map(c=>`<div style="display:flex;justify-content:space-between;gap:10px;font-size:13px"><span><b>${escapeHtml(c.name)}</b> ${c.phone?"— "+escapeHtml(c.phone):"<i>(no phone)</i>"}</span><span style="color:var(--ink-soft)">${recCount(c)} record${recCount(c)===1?"":"s"}</span></div>`).join("")}</div>`).join("") : `<p style="font-size:13px">No duplicate profiles.</p>`}
+    ${orphans.length ? `<p style="font-size:12.5px;color:var(--ink-soft)">${orphans.length} older credit/advance record${orphans.length===1?"":"s"} not attached to any profile will also be linked to the matching customer.</p>` : ""}
+  </div>
+  <div class="modal-foot"><button class="btn btn-ghost" onclick="window.__closeModal()">Cancel</button>
+  <button class="btn btn-primary" id="mergeGo">Merge ${groups.length} group${groups.length===1?"":"s"}</button></div>`);
+  document.getElementById("mergeGo").onclick = async ()=>{
+    let merged = 0, moved = 0, linked = 0;
+    for(const g of findDuplicateCustomerGroups()){ const r = await mergeCustomerGroup(g); merged += r.merged; moved += r.moved; }
+    for(const { col, r } of findUnlinkedAccountRecords()){
+      const c = state.customers.find(x=>sameCustomerProfile(x, { name:r.customerName, phone:r.phone }));
+      if(c){ r.customerId = c.id; r.customerName = c.name; await dataSet(col, r); linked++; }
+    }
+    closeModal();
+    toast(`Done — ${merged} duplicate profile${merged===1?"":"s"} merged, ${moved+linked} record${moved+linked===1?"":"s"} re-linked.`, "ok", 6000);
+    renderCustomers();
+  };
+};
 function renderCustomers(){
   const html = `<div class="card"><div class="section-head"><div><h3>Customers</h3><p>${state.customers.length} total</p></div>
     <div class="toolbar"><div class="searchbox"><input id="custSearch2" placeholder="Search name or phone…"></div>
     <button class="btn btn-primary btn-sm" onclick="openCustomerModal(null)">+ Add Customer</button></div></div>
+    <div id="dupBanner"></div>
     <div class="table-wrap"><table><thead><tr><th>Name</th><th>Phone</th><th>Address</th><th>Purchases</th><th>Debt</th><th></th></tr></thead>
     <tbody id="custBody"></tbody></table></div></div>`;
   setContent(html);
+  {
+    const dups = findDuplicateCustomerGroups(), extra = dups.reduce((n,g)=>n+g.length-1,0), orphans = findUnlinkedAccountRecords().length;
+    if(extra || orphans){
+      document.getElementById("dupBanner").innerHTML = `<div class="ca-hint" style="background:var(--warn-bg,#fff7e0);border:1px solid #f0d58a;border-radius:10px;padding:10px 12px;margin:0 0 12px;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+        <span>⚠️ ${extra ? `<b>${extra}</b> customer${extra===1?" has":"s have"} more than one profile` : ""}${extra&&orphans?" and ":""}${orphans?`<b>${orphans}</b> credit/advance record${orphans===1?" is":"s are"} not linked to a profile`:""}.</span>
+        ${can("changeSettings") ? `<button class="btn btn-primary btn-sm" onclick="openMergeDuplicatesModal()">Merge into one profile each</button>` : `<span>Ask an Admin to merge them.</span>`}</div>`;
+    }
+  }
   const draw = ()=>{
     const q=(document.getElementById("custSearch2").value||"").toLowerCase();
     const rows = state.customers.filter(c=>String(c.name||"").toLowerCase().includes(q)||String(c.phone||"").includes(q));
@@ -5093,7 +5787,7 @@ function renderCustomers(){
       return `<tr><td><b>${escapeHtml(c.name)}</b></td><td>${escapeHtml(c.phone)}</td><td>${escapeHtml(c.address||"-")}</td>
         <td>${purchases}</td><td>${debt>0?`<span class="pill pill-danger">${money(debt)}</span>`:"—"}</td>
         <td class="row-actions"><button class="icon-sm" onclick="viewCustomerHistory('${c.id}')">👁️</button>
-        <button class="icon-sm" onclick="openCustomerModal('${c.id}')">✏️</button></td></tr>`;
+        <button class="icon-sm" onclick="openCustomerModal('${c.id}')">✏️</button>${can("deleteRecords")?`<button class="icon-sm" title="Delete customer account" onclick="deleteCustomer('${c.id}')">🗑️</button>`:""}</td></tr>`;
     }).join("") : `<tr><td colspan="6"><div class="empty-state"><div class="ic">👥</div>No customers yet</div></td></tr>`;
   };
   document.getElementById("custSearch2").addEventListener("input", draw); draw();
@@ -5111,8 +5805,17 @@ window.openCustomerModal = function(id, prefillName=""){
   document.getElementById("cfSave").onclick = async ()=>{
     const name = document.getElementById("cfName").value.trim();
     if(!name) return toast("Name is required","err");
-    const updated = Object.assign({}, c, { name, phone:document.getElementById("cfPhone").value.trim(),
-      address:document.getElementById("cfAddr").value.trim(), notes:document.getElementById("cfNotes").value.trim() });
+    const phoneVal = document.getElementById("cfPhone").value.trim(), addrVal = document.getElementById("cfAddr").value.trim(), notesVal = document.getElementById("cfNotes").value.trim();
+    // A customer keeps ONE profile: if this name/phone already exists, reuse that profile instead of saving a second one.
+    const dup = findCustomerMatch(name, phoneVal, id);
+    if(dup && id){
+      toast(`Another profile already matches (${dup.name}${dup.phone?" — "+dup.phone:""}). Use "Merge into one profile" on the Customers page to combine them.`, "err", 7000);
+      return;
+    }
+    const updated = dup
+      ? Object.assign({}, dup, { phone:dup.phone||phoneVal, address:dup.address||addrVal, notes:dup.notes||notesVal })
+      : Object.assign({}, c, { name, phone:phoneVal, address:addrVal, notes:notesVal });
+    if(dup) toast(`${dup.name} already has a profile — using it instead of creating a second one.`, "warn", 5000);
     await dataSet("customers", updated);
     const i = state.customers.findIndex(x=>x.id===updated.id);
     if(i>=0) state.customers[i]=updated; else state.customers.push(updated);
@@ -5156,7 +5859,7 @@ function renderSuppliers(){
     <button class="btn btn-primary btn-sm" onclick="openSupplierModal(null)">+ Add Supplier</button></div>
     <div class="table-wrap"><table><thead><tr><th>Name</th><th>Phone</th><th>Outstanding Balance</th><th></th></tr></thead>
     <tbody>${state.suppliers.length? state.suppliers.map(s=>`<tr><td>${escapeHtml(s.name)}</td><td>${escapeHtml(s.phone||"-")}</td>
-      <td>${money(s.balance||0)}</td><td class="row-actions"><button class="icon-sm" title="Edit details" onclick="openSupplierModal('${s.id}')">✏️</button><button class="btn btn-sm btn-ghost" onclick="viewSupplierLedger('${s.id}')">Ledger</button></td></tr>`).join("")
+      <td>${money(s.balance||0)}</td><td class="row-actions"><button class="icon-sm" title="Edit details" onclick="openSupplierModal('${s.id}')">✏️</button>${can("deleteRecords")?`<button class="icon-sm" title="Delete supplier" onclick="deleteSupplier('${s.id}')">🗑️</button>`:""}<button class="btn btn-sm btn-ghost" onclick="viewSupplierLedger('${s.id}')">Ledger</button></td></tr>`).join("")
       : `<tr><td colspan="4"><div class="empty-state"><div class="ic">🚚</div>No suppliers yet</div></td></tr>`}</tbody></table></div></div>`;
   setContent(html);
 }
@@ -5250,9 +5953,9 @@ function renderExpenses(){
   const total = state.expenses.reduce((a,e)=>a+e.amount,0);
   const html = `<div class="card"><div class="section-head"><div><h3>Expenses</h3><p>Total recorded: ${money(total)}</p></div>
     <button class="btn btn-primary btn-sm" onclick="openExpenseModal()">+ Add Expense</button></div>
-    <div class="table-wrap"><table><thead><tr><th>Category</th><th>Amount</th><th>Notes</th><th>Date</th></tr></thead>
+    <div class="table-wrap"><table><thead><tr><th>Category</th><th>Amount</th><th>Notes</th><th>Date</th><th></th></tr></thead>
     <tbody>${state.expenses.length? [...state.expenses].sort((a,b)=>b.createdAt-a.createdAt).map(e=>`
-      <tr><td>${escapeHtml(e.category)}</td><td>${money(e.amount)}</td><td>${escapeHtml(e.notes||"-")}</td><td>${fmtDate(e.createdAt)}</td></tr>`).join("")
+      <tr><td>${escapeHtml(e.category)}</td><td>${money(e.amount)}</td><td>${escapeHtml(e.notes||"-")}</td><td>${fmtDate(e.createdAt)}</td><td class="row-actions">${can("deleteRecords")?`<button class="icon-sm" title="Delete expense" onclick="deleteExpense('${e.id}')">🗑️</button>`:""}</td></tr>`).join("")
       : `<tr><td colspan="4"><div class="empty-state"><div class="ic">💵</div>No expenses recorded</div></td></tr>`}</tbody></table></div></div>`;
   setContent(html);
 }
@@ -5366,7 +6069,7 @@ function runReport(){
 function renderSettings(){
   const s = state.settings;
   const staffUsernames = USERS.map(u=>u.username);
-  Promise.all(staffUsernames.map(un=>effectiveStaffRecord(un))).then(staffList=>{
+  (can("editUsers") ? syncStaffProfiles() : Promise.resolve()).then(()=>Promise.all(staffUsernames.map(un=>effectiveStaffRecord(un)))).then(staffList=>{
   const html = `
   <div class="grid grid-2">
     <div class="card">
@@ -5375,12 +6078,14 @@ function renderSettings(){
         <div class="field"><label>Store Name</label><input id="stName" value="${escapeHtml(s.name)}" ${can("changeSettings")?"":"disabled"}></div>
         <div class="field"><label>Phone</label><input id="stPhone" value="${escapeHtml(s.phone)}" ${can("changeSettings")?"":"disabled"}></div>
         <div class="field" style="grid-column:1/-1"><label>Address</label><input id="stAddr" value="${escapeHtml(s.address||"")}" ${can("changeSettings")?"":"disabled"}></div>
-        <div class="field" style="grid-column:1/-1"><label>Receipt Footer</label><input id="stFooter" value="${escapeHtml(s.footer||"")}" ${can("changeSettings")?"":"disabled"}></div>
+        <div class="field" style="grid-column:1/-1"><label>Receipt Footer</label><textarea id="stFooter" rows="4" ${can("changeSettings")?"":"disabled"}>${escapeHtml(s.footer||"")}</textarea></div>
         <div class="field" style="grid-column:1/-1"><label>Return Policy</label><textarea id="stPolicy" ${can("changeSettings")?"":"disabled"}>${escapeHtml(s.returnPolicy||"")}</textarea></div>
         <div class="field"><label>Currency Symbol</label><input id="stCurr" value="${escapeHtml(s.currency||"₦")}" ${can("changeSettings")?"":"disabled"}></div>
         <div class="field"><label>Default Tax %</label><input type="number" id="stTax" value="${s.taxRate||0}" ${can("changeSettings")?"":"disabled"}></div>
       </div>
-      ${can("changeSettings")?`<button class="btn btn-primary" id="stSave" style="margin-top:10px">Save Settings</button>`:`<p style="font-size:12px;color:var(--ink-soft)">Only Admin can change settings.</p>`}
+      <div id="settingsInfoLine" style="font-size:12px;color:var(--ink-soft);margin-top:12px"></div>
+      <div id="syncStatus" style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;margin-top:6px"></div>
+      ${can("changeSettings")?`<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px"><button class="btn btn-primary" id="stSave">Save Settings</button><button class="btn btn-ghost" id="syncNowBtn" title="Upload anything waiting and fetch the latest from the cloud">🔄 Sync now</button></div>`:`<p style="font-size:12px;color:var(--ink-soft)">Only Admin can change settings.</p>`}
     </div>
     <div class="card">
       <div class="section-head"><h3>Appearance</h3></div>
@@ -5409,25 +6114,29 @@ function renderSettings(){
     <div class="card">
       <div class="section-head"><h3>Manage Staff</h3></div>
       <div class="table-wrap"><table><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th></th></tr></thead>
-      <tbody>${staffList.filter(Boolean).map(st=>`
-        <tr><td class="mono">${escapeHtml(st.username)}</td><td>${escapeHtml(st.name)}</td><td>${escapeHtml(st.role)}</td>
-        <td><span class="pill ${st.active===false?'pill-danger':'pill-ok'}">${st.active===false?'Deactivated':'Active'}</span></td>
-        <td><button class="btn btn-sm btn-ghost" onclick="openEditStaffModal('${escapeHtml(st.username)}')">Edit</button></td></tr>
-      `).join("")}</tbody></table></div>
+      <tbody id="staffBody">${staffRowsHTML(staffList)}</tbody></table></div>
       <p style="font-size:11.5px;color:var(--ink-soft);margin-top:8px">You can edit a staff member's name, role, or deactivate their account here. Adding a brand-new staff login is a separate, one-time setup step — ask whoever maintains this app.</p>
+    </div>` : ""}
+    ${can("deleteRecords") ? `
+    <div class="card" style="grid-column:1/-1">
+      <div class="section-head"><div><h3>🗂️ Data Manager</h3><p>Admin only — find any record and delete it permanently. Every deletion and every settings change is written to the Activity Log (choose "Activity log" below to see it).</p></div></div>
+      <div class="toolbar" style="margin-bottom:10px;flex-wrap:wrap">
+        <select id="dmType" style="padding:8px 10px;border-radius:8px;border:1px solid var(--line)">
+          <option value="customers">Customers</option><option value="advances">Advance payments</option><option value="debts">Credit / debt records</option>
+          <option value="sales">Sales &amp; receipts</option><option value="returns">Returns</option><option value="products">Products</option>
+          <option value="suppliers">Suppliers</option><option value="expenses">Expenses</option><option value="stockHistory">Stock history entries</option>
+          <option value="payments">Payments ledger entries</option><option value="log">🧾 Activity log</option></select>
+        <div class="searchbox"><input id="dmSearch" placeholder="Search…"></div>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>Record</th><th>Details</th><th>Date</th><th></th></tr></thead><tbody id="dmBody"></tbody></table></div>
     </div>` : ""}
   </div>`;
   setContent(html);
+  snapshotSettingsBaseline(); updateSyncStatus();
+  if(can("deleteRecords")) initDataManager();
   if(can("changeSettings")){
-    document.getElementById("stSave").addEventListener("click", async ()=>{
-      const updated = Object.assign({}, s, { id:"store_info",
-        name:document.getElementById("stName").value.trim(), phone:document.getElementById("stPhone").value.trim(),
-        address:document.getElementById("stAddr").value.trim(), footer:document.getElementById("stFooter").value.trim(),
-        returnPolicy:document.getElementById("stPolicy").value.trim(), currency:document.getElementById("stCurr").value.trim()||"₦",
-        taxRate:+document.getElementById("stTax").value||0 });
-      await dataSet("settings", updated); state.settings = updated;
-      toast("Settings saved","ok");
-    });
+    document.getElementById("stSave").addEventListener("click", saveSettingsForm);
+    document.getElementById("syncNowBtn").addEventListener("click", syncNow);
     document.getElementById("resetBtn").addEventListener("click", ()=> confirmDialog("This will erase ALL local data (products, sales, customers, etc). This cannot be undone. Continue?", async ()=>{
       for(const c of COLLECTIONS){ const all = await idbGetAll(c); for(const r of all) await idbDelete(c, r.id); }
       toast("System reset. Reloading…","ok"); setTimeout(()=>location.reload(), 1200);
@@ -5527,7 +6236,7 @@ window.openEditStaffModal = async function(username){
       return;
     }
     try{ await idbPut("users", updated); }catch(e){ console.warn("[Staff] Could not cache locally.", e); }
-    closeModal(); toast(active===false?"Account deactivated":"Staff record updated","ok"); renderSettings();
+    closeModal(); toast(active===false?"Account deactivated — they will be signed out on their device within seconds":"Staff record updated — it goes live on their device within seconds","ok",5000); renderSettings();
   });
   // Resetting a password only ever updates the profile's stored hash —
   // it deliberately never touches Firebase Auth itself, since that would
