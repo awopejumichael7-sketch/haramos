@@ -1035,7 +1035,7 @@ async function reloadAll(){
   state.advances = await dataGetAll("advancePayments");
   state.receipts = await dataGetAll("receipts");
   state.payments = await dataGetAll("payments");
-  state.users = await dataGetAll("users");
+  // (Staff profiles are fetched only where they are needed — Admin's Manage Staff screen — not on every start-up.)
   state.returns = await dataGetAll("returns");
   const storeSettings = await idbGet("settings", "store_info");
   state.settings = storeSettings || STORE;
@@ -1402,6 +1402,7 @@ const NAV = [
   ]},
   { section:"Finance", items:[
     {id:"expenses", ic:"💵", label:"Expenses"},
+    {id:"paysum", ic:"💰", label:"Payment Summary"},
     {id:"reports", ic:"📈", label:"Reports"},
   ]},
   { section:"System", items:[
@@ -1454,7 +1455,8 @@ function goPage(id){
   renderNav();
   const renderers = { dashboard:renderDashboard, sales:renderSales, receipts:renderReceipts, returns:renderReturnsPage, credit:renderCredit,
     products:renderProducts, inventory:renderInventory, categories:renderCategories, customers:renderCustomers,
-    suppliers:renderSuppliers, expenses:renderExpenses, reports:renderReports, settings:renderSettings };
+    suppliers:renderSuppliers, expenses:renderExpenses, reports:renderReports, settings:renderSettings,
+    paysum:()=>renderPaymentSummary(true) };
   (renderers[id] || renderDashboard)();
 }
 
@@ -1628,12 +1630,17 @@ function renderDashboard(){
   const totalDebtOwed = state.debts.reduce((a,d)=>a+Math.max(0,d.balance||0),0);
   const overdueDebts = state.debts.filter(isDebtOverdue);
   const totalStoreCredit = state.advances.reduce((a,adv)=>a+Math.max(0,adv.creditBalance||0),0);
+  // Money actually received today, by method (from the Payments ledger — see Payment Summary page)
+  const payToday = paysumByDay(paysumEntries()).get(localDateStr()) || { Cash:0, POS:0, Transfer:0 };
 
   const cards = [
     {lbl:"Today's Sales", val:money(todaySalesTotal), ic:"💰", bg:"var(--brand-light)", fg:"var(--brand-dark)"},
     {lbl:"Today's Profit", val:money(todayProfit), ic:"📈", bg:"var(--ok-light)", fg:"var(--ok)"},
     {lbl:"Weekly Sales", val:money(sum(weekSales,s=>s.total)), ic:"🗓️", bg:"var(--info-light)", fg:"var(--info)"},
     {lbl:"Monthly Sales", val:money(sum(monthSales,s=>s.total)), ic:"📆", bg:"var(--gold-light)", fg:"var(--warn)"},
+    {lbl:"Cash Received Today", val:paysumMoney(payToday.Cash), ic:"💵", bg:"var(--ok-light)", fg:"var(--ok)"},
+    {lbl:"POS Received Today", val:paysumMoney(payToday.POS), ic:"💳", bg:"var(--info-light)", fg:"var(--info)"},
+    {lbl:"Transfer Received Today", val:paysumMoney(payToday.Transfer), ic:"🏦", bg:"var(--gold-light)", fg:"var(--warn)"},
     {lbl:"Stock Value", val:money(stockValue), ic:"🏬", bg:"var(--brand-light)", fg:"var(--brand-dark)"},
     {lbl:"Total Products", val:state.products.length, ic:"📦", bg:"var(--info-light)", fg:"var(--info)"},
     {lbl:"Customers", val:state.customers.length, ic:"👥", bg:"var(--ok-light)", fg:"var(--ok)"},
@@ -1819,7 +1826,7 @@ async function pushDebtToLinkedSale(debt){
 // Apply a payment to one debt (no ledger entry — callers decide how the money is recorded).
 // A debt that mirrors an Advance Payment shortfall is settled by crediting the payment onto the advance itself and
 // re-deriving the balance from it; decrementing debt.balance as well would count the same payment twice.
-async function applyDebtPayment(debt, amt, method, ref){
+async function applyDebtPayment(debt, amt, method, ref, sale){
   debt.history = debt.history || [];
   const entry = { amount:amt, date:Date.now(), method, by:state.user.name };
   if(ref) entry.ref = ref;
@@ -1827,7 +1834,11 @@ async function applyDebtPayment(debt, amt, method, ref){
     debt.history.push(entry);
     const adv = state.advances.find(a=>a.id===debt.advanceId);
     if(adv){
+      const prevPaid = adv.amountPaid;
       adv.amountPaid = r2(adv.amountPaid + amt);
+      // Remember which real method(s) this added (also on the history entry, so undoing it can reverse it exactly).
+      const lines = linesForPayment(method, amt, sale);
+      if(lines){ entry.lines = lines; noteAdvanceMoneyIn(adv, prevPaid, lines); }
       await dataSet("advancePayments", adv);
       await syncAdvanceDebt(adv);
     } else {
@@ -1845,11 +1856,13 @@ async function applyDebtPayment(debt, amt, method, ref){
 async function unapplyDebtPayment(debt, amt, ref){
   debt.history = debt.history || [];
   const i = debt.history.findIndex(h=>h.ref===ref && Math.abs((+h.amount||0)-amt)<0.01);
+  const undone = i>=0 ? debt.history[i] : null;
   if(i>=0) debt.history.splice(i,1);
   if(debt.advanceId){
     const adv = state.advances.find(a=>a.id===debt.advanceId);
     if(adv){
       adv.amountPaid = r2(Math.max(0, adv.amountPaid - amt));
+      if(undone && undone.lines && adv.paymentBreakdown) adv.paymentBreakdown = subtractPaymentLines(adv.paymentBreakdown, undone.lines);
       await dataSet("advancePayments", adv);
       await syncAdvanceDebt(adv);
       return;
@@ -1868,7 +1881,7 @@ async function allocateExcess(customer, amount, method, sale){
     if(remaining <= 0.009) break;
     const pay = r2(Math.min(debt.balance, remaining));
     if(pay <= 0.009) continue;
-    await applyDebtPayment(debt, pay, method, sale.receiptNumber);
+    await applyDebtPayment(debt, pay, method, sale.receiptNumber, sale);
     allocations.push({ debtId:debt.id, receiptNumber:debt.receiptNumber, amount:pay });
     toDebt = r2(toDebt + pay); remaining = r2(remaining - pay);
   }
@@ -1884,6 +1897,122 @@ async function allocateExcess(customer, amount, method, sale){
 }
 // Live "what happens to the money" box under the payment method (amount received vs amount due).
 let excessModePref = "account";
+// "Paid by" for Credit and Advance Payment: those options only ask "amount paid now", so the cashier also says HOW it
+// was paid. The answer goes into the payments ledger under that real method (Payment Summary reads it from there).
+const PAID_BY_SPLIT = "__split__";
+function paidByRowHTML(){
+  return `<div class="cart-row" id="paidByRow"><span>Paid By <span style="color:var(--ink-soft);font-size:11px">(for the amount paid now)</span></span>
+    <select id="paidBySel" style="width:150px;margin-left:auto;padding:5px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--ink)">
+      <option value="">Choose…</option>${PAYMENT_METHODS_STANDARD.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("")}
+      <option value="${PAID_BY_SPLIT}">Split (more than one)</option></select></div>`;
+}
+// Returns [{method,amount}] for the money paid now, [] if nothing was paid, or null if the cashier must fix something first.
+async function resolvePaidBy(amount){
+  if(!(amount>0.009)) return [];
+  const v = document.getElementById("paidBySel")?.value || "";
+  if(!v){ toast("Choose how the amount paid now was paid (Cash, Transfer, POS…).","err",5000); return null; }
+  if(v!==PAID_BY_SPLIT) return [{ method:v, amount:r2(amount) }];
+  const res = await promptSplitPaymentModal(amount, "Amount paid now");
+  if(res===null) return null;
+  if(Math.abs(res.total - amount) > 0.009){
+    toast(`The split adds up to ${money(res.total)} but the amount paid now is ${money(amount)} — try again so they match.`,"err",6000);
+    return null;
+  }
+  return res.lines.map(l=>({ method:l.method, amount:r2(l.amount) }));
+}
+
+// Inline "Paid By" for dialogs that are already open (Add Advance Payment, Manage Advance). The Sales Screen's Split popup
+// would replace such a dialog and wipe what was typed, so these show the split rows in place. `p` is an id prefix.
+function paidByInlineHTML(p, hint){
+  return `<div class="field"><label>Paid By <span style="color:var(--ink-soft);font-size:11px">(${escapeHtml(hint)})</span></label>
+      <select id="${p}PaidBy"><option value="">Choose…</option>${PAYMENT_METHODS_STANDARD.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("")}<option value="${PAID_BY_SPLIT}">Split (more than one)</option></select></div>
+    <div id="${p}SplitBox" style="display:none;margin-bottom:10px">
+      <div id="${p}SplitRows"></div>
+      <button class="btn btn-ghost btn-sm" id="${p}SplitAdd" type="button">+ Add payment method</button>
+      <div class="cart-row total" style="margin-top:8px"><span>Remaining</span><span id="${p}SplitRemaining">${money(0)}</span></div>
+    </div>`;
+}
+function wirePaidByInline(p, amountEl){
+  const sel = document.getElementById(`${p}PaidBy`), box = document.getElementById(`${p}SplitBox`), rows = document.getElementById(`${p}SplitRows`);
+  const paid = ()=> Math.max(0, +amountEl.value||0);
+  const remaining = ()=>{
+    const sum = [...rows.children].reduce((a,r)=>a+(+r.querySelector(`.${p}SpAmt`).value||0),0);
+    document.getElementById(`${p}SplitRemaining`).textContent = sum > paid() + 0.009 ? "Excess " + money(sum-paid()) : money(Math.max(0,paid()-sum));
+  };
+  const addRow = (method, amount)=>{
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:8px;margin-bottom:8px;align-items:center;";
+    row.innerHTML = `<select class="${p}SpMethod" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)">${PAYMENT_METHODS_STANDARD.map(m=>`<option ${m===method?"selected":""}>${escapeHtml(m)}</option>`).join("")}</select>
+      <input type="number" class="${p}SpAmt" value="${amount||0}" min="0" style="width:120px;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)">
+      <button class="icon-sm ${p}SpRem" type="button">✕</button>`;
+    row.querySelector(`.${p}SpAmt`).addEventListener("input", remaining);
+    row.querySelector(`.${p}SpRem`).addEventListener("click", ()=>{ row.remove(); remaining(); });
+    rows.appendChild(row);
+  };
+  sel.addEventListener("change", ()=>{
+    const isSplit = sel.value === PAID_BY_SPLIT;
+    box.style.display = isSplit ? "" : "none";
+    if(isSplit && !rows.children.length){ addRow("Cash", paid()); addRow("Transfer", 0); }
+    remaining();
+  });
+  amountEl.addEventListener("input", remaining);
+  document.getElementById(`${p}SplitAdd`).addEventListener("click", ()=> addRow("Cash", 0));
+}
+// [{method,amount}] for the money paid, [] if nothing was paid, or null (with a message shown) if the cashier must fix something.
+function readPaidByInline(p, amount, what){
+  if(!(amount>0.009)) return [];
+  const pb = document.getElementById(`${p}PaidBy`).value;
+  if(!pb){ toast(`Choose how ${what} was paid (Cash, Transfer, POS…).`,"err",5000); return null; }
+  if(pb !== PAID_BY_SPLIT) return [{ method:pb, amount:r2(amount) }];
+  const lines = [...document.getElementById(`${p}SplitRows`).children]
+    .map(r=>({ method:r.querySelector(`.${p}SpMethod`).value, amount:r2(+r.querySelector(`.${p}SpAmt`).value||0) }))
+    .filter(l=>l.amount>0);
+  if(!lines.length){ toast("Add at least one payment line for the split.","err"); return null; }
+  const sum = lines.reduce((a,l)=>a+l.amount,0);
+  if(Math.abs(sum - amount) > 0.009){ toast(`The split adds up to ${money(sum)} but ${what} is ${money(amount)} — make them match.`,"err",6000); return null; }
+  return lines;
+}
+// Adds payment lines to a running per-method list (same method -> amounts are summed).
+function mergePaymentLines(base, add){
+  const out = (base||[]).map(l=>({ method:l.method, amount:r2(+l.amount||0) }));
+  for(const l of add){
+    const e = out.find(x=>x.method===l.method);
+    if(e) e.amount = r2(e.amount + l.amount); else out.push({ method:l.method, amount:r2(l.amount) });
+  }
+  return out;
+}
+// Exact reverse of mergePaymentLines (used when a payment that was added to an advance is undone).
+function subtractPaymentLines(base, sub){
+  const out = (base||[]).map(l=>({ method:l.method, amount:r2(+l.amount||0) }));
+  for(const l of sub){ const e = out.find(x=>x.method===l.method); if(e) e.amount = r2(e.amount - l.amount); }
+  return out.filter(l=>l.amount > 0.009);
+}
+// Splits `amt` across a sale's payment lines in proportion to what each one paid (the last line absorbs rounding).
+function allocateToLines(amt, lines){
+  const tot = lines.reduce((a,l)=>a+l.amount,0);
+  if(!(tot > 0)) return null;
+  let left = r2(amt);
+  const out = lines.map((l,i)=>{ const v = i===lines.length-1 ? left : Math.min(left, r2(amt*l.amount/tot)); left = r2(left - v); return { method:l.method, amount:v }; });
+  return out.filter(l=>l.amount > 0.009);
+}
+// The real payment method(s) behind a payment that was applied to an advance's shortfall. A single method is used as is;
+// a payment that came from an overpaid combo/split sale is divided across that sale's own lines. null = cannot tell.
+function linesForPayment(method, amt, sale){
+  if(PAYMENT_METHODS_STANDARD.includes(method)) return [{ method, amount:r2(amt) }];
+  const src = (sale && Array.isArray(sale.paymentBreakdown)) ? sale.paymentBreakdown.filter(l=>PAYMENT_METHODS_STANDARD.includes(l.method) && l.amount>0) : [];
+  return src.length ? allocateToLines(amt, src) : null;
+}
+// Keeps an advance's "how it was paid" list in step with money received on it, so its receipt lines add up. Only done
+// when the list's starting point is known: the record's own list, else the original sale's, else nothing was paid before.
+// (A record whose earlier payments had no method recorded keeps showing no list, exactly as before.)
+function noteAdvanceMoneyIn(adv, prevPaid, lines){
+  if(!lines || !lines.length || adv.pickupOnly) return;
+  let base = adv.paymentBreakdown || null;
+  if(!base && adv.saleId){ const orig = state.sales.find(x=>x.id===adv.saleId); if(orig && orig.paymentBreakdown) base = orig.paymentBreakdown; }
+  if(!base && prevPaid <= 0.009) base = [];
+  if(base) adv.paymentBreakdown = mergePaymentLines(base, lines);
+}
+
 function updatePayOutcome(){
   const host = document.getElementById("payOutcome"); if(!host) return;
   const checked = document.querySelector('input[name="paym"]:checked');
@@ -1988,6 +2117,7 @@ function updatePayDetails(){
   const checked = document.querySelector('input[name="paym"]:checked');
   const method = checked ? checked.value : "Cash";
   const grandTotal = cartTotals().total;
+  const prevPaidBy = document.getElementById("paidBySel")?.value || "";   // keep the cashier's choice if this box redraws
   // Store credit, if applied, reduces only what still needs to be collected
   // by the chosen payment method below — it never changes the real total.
   const creditAvail = state.activeCustomer ? customerStoreCredit(state.activeCustomer.id) : 0;
@@ -2019,6 +2149,7 @@ function updatePayDetails(){
       ${creditNote}
       <p class="pay-detail-note">${state.activeCustomer? "Customer: <b>"+escapeHtml(state.activeCustomer.name)+"</b>." : "⚠️ Select a customer above — Credit sales must be linked to a customer."} Enter anything paid now; the rest is saved as a debt on their account.</p>
       <div class="cart-row"><span>Amount Paid Now</span><input type="number" id="creditPaidNow" min="0" max="${dueAfterCredit}" value="0" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
+      ${paidByRowHTML()}
     </div>`;
   } else if(method==="Advance Payment"){
     host.innerHTML = `<div class="pay-detail-box">
@@ -2026,6 +2157,7 @@ function updatePayDetails(){
       <p class="pay-detail-note">${state.activeCustomer? "Customer: <b>"+escapeHtml(state.activeCustomer.name)+"</b>." : "⚠️ Select a customer above — Advance Payments must be linked to a customer."} Goods are reserved and collected later. Enter what's paid today (defaults to the full amount due). You can pay <b>more than the amount due</b> — the extra is kept as store credit on the customer's account.</p>
       ${state.cart.length ? "" : `<p class="pay-detail-note">🛍️ No products selected — this will be saved as an <b>advance deposit</b> and added to the customer's store credit.</p>`}
       <div class="cart-row"><span>Amount Paid Now</span><input type="number" id="advPaidNow" min="0" value="${fmtQty(dueAfterCredit)}" style="width:120px;text-align:right;padding:5px 8px;border-radius:6px;border:1px solid var(--line)"></div>
+      ${paidByRowHTML()}
     </div>`;
   } else {
     // Single method (Cash, Transfer, POS …): the cashier types what the customer actually handed over.
@@ -2035,6 +2167,8 @@ function updatePayDetails(){
       <div id="payOutcome"></div></div>`;
     document.getElementById("amountReceived").addEventListener("input", updatePayOutcome);
   }
+  const pbSel = document.getElementById("paidBySel");
+  if(pbSel && prevPaidBy) pbSel.value = prevPaidBy;
   updatePayOutcome();
 }
 
@@ -2367,13 +2501,18 @@ async function depositCheckout(){
   const amount = r2(Math.max(0, +document.getElementById("advPaidNow")?.value||0));
   if(!(amount>0)){ toast("Enter the amount the customer is paying in advance.","err"); return; }
   const note = document.getElementById("saleNotes").value.trim();
+  const paidLines = await resolvePaidBy(amount);   // how the deposit was paid (Cash / Transfer / POS …)
+  if(paidLines===null) return;
   const adv = { id:genId("adv"), customerId:cust.id, customerName:cust.name, phone:cust.phone||"", saleId:null,
     receiptNumber:"ADV-"+Date.now().toString().slice(-8), amountPaid:amount, total:0, balance:0, creditBalance:amount,
     products:[], collectionStatus:"Fully Collected", isDeposit:true, notes: note || "Advance deposit (no products selected)",
+    paymentBreakdown: paidLines.map(l=>({ method:l.method, amount:l.amount })),
     createdBy: state.user.name, createdAt: Date.now() };
   await dataSet("advancePayments", adv); state.advances.push(adv);
-  await dataSet("payments", { id:genId("pay"), type:"advance", advanceId:adv.id, receiptNumber:adv.receiptNumber,
-    method:"Advance Payment", amount, createdAt:Date.now(), by:state.user.name, customerId:cust.id });
+  for(const l of paidLines){
+    await dataSet("payments", { id:genId("pay"), type:"advance", advanceId:adv.id, receiptNumber:adv.receiptNumber,
+      method:l.method, amount:l.amount, createdAt:Date.now(), by:state.user.name, customerId:cust.id });
+  }
   state.cart = []; state.activeCustomer = null;
   toast(`Advance deposit of ${money(amount)} saved — ${adv.receiptNumber}`, "ok");
   showReceiptModal(enrichSaleWithReturns(buildAdvanceReceiptSale(adv)));
@@ -2454,10 +2593,14 @@ async function checkoutInner(){
   if(method==="Credit"){
     if(!state.activeCustomer){ toast(`Select or add a customer first — ${method} needs a customer on file.`, "err"); return; }
     const paid = r2(Math.min(payDue, Math.max(0, +document.getElementById("creditPaidNow")?.value||0)));
+    const pl = await resolvePaidBy(paid); if(pl===null) return;
+    if(pl.length) paymentBreakdown = pl;
     amountPaid = paid; balance = r2(payDue-paid);
   } else if(method==="Advance Payment"){
     if(!state.activeCustomer){ toast(`Select or add a customer first — ${method} needs a customer on file.`, "err"); return; }
     const paid = r2(Math.max(0, +document.getElementById("advPaidNow")?.value||0));
+    const pl = await resolvePaidBy(paid); if(pl===null) return;
+    if(pl.length) paymentBreakdown = pl;
     amountPaid = paid; balance = r2(Math.max(0, payDue-paid));
   } else if(coveredByCredit && (method==="Split Payment" || COMBO_METHODS[method])){
     amountPaid = 0; balance = 0;
@@ -2536,7 +2679,7 @@ async function checkoutInner(){
   // save each payment method to the payments ledger (the ledger always equals the money really received, once)
   if(paymentBreakdown){
     for(const l of paymentBreakdown){
-      await dataSet("payments", { id:genId("pay"), type:"split", saleId:sale.id, receiptNumber,
+      await dataSet("payments", { id:genId("pay"), type:(paymentBreakdown.length>1 || method==="Split Payment" || COMBO_METHODS[method]) ? "split" : "sale", saleId:sale.id, receiptNumber,
         method:l.method, amount:l.amount, createdAt:Date.now(), by:state.user.name });
     }
   } else if(!isTender){
@@ -2648,12 +2791,12 @@ function promptPaymentSplit(total){
     };
   });
 }
-function promptSplitPaymentModal(total){
+function promptSplitPaymentModal(total, label){
   return new Promise(resolve=>{
     const methods = ["Cash","Transfer","POS","Bank","Mobile Money","Cheque","Wallet"];
     openModal(`<div class="modal-head"><h3>Split Payment</h3><button class="close-x" id="spCancel1">✕</button></div>
     <div class="modal-body">
-      <p style="font-size:13px;color:var(--ink-soft)">Total due: <b>${money(total)}</b>. Break the payment down across two or more methods.</p>
+      <p style="font-size:13px;color:var(--ink-soft)">${escapeHtml(label||"Total due")}: <b>${money(total)}</b>. Break the payment down across two or more methods.</p>
       <div id="spRows"></div>
       <button class="btn btn-ghost btn-sm" id="spAddRow" style="margin-top:6px">+ Add payment method</button>
       <div class="cart-row total" style="margin-top:14px"><span>Remaining</span><span id="spRemaining">${money(total)}</span></div>
@@ -2973,7 +3116,7 @@ function buildDebtReceiptSale(d){
 function buildAdvanceReceiptSale(a){
   const original = a.saleId && state.sales.find(s=>s.id===a.saleId);
   if(original && a.pickupOnly) return Object.assign({}, original, { advanceProducts:a.products||[], advanceCollections:a.collections||[], collectionStatus:a.collectionStatus });
-  if(original) return Object.assign({}, original, { amountPaid:a.amountPaid, balance:a.balance, advanceProducts:a.products||[], advanceCollections:a.collections||[], creditBalance:a.creditBalance||0 });
+  if(original) return Object.assign({}, original, { amountPaid:a.amountPaid, balance:a.balance, paymentBreakdown:a.paymentBreakdown || original.paymentBreakdown || null, advanceProducts:a.products||[], advanceCollections:a.collections||[], creditBalance:a.creditBalance||0 });
   // A deposit with no products: the receipt total is simply the amount deposited.
   const total = a.isDeposit ? a.amountPaid : (a.total!=null ? a.total : a.amountPaid);
   const qtyTotal = (a.products||[]).reduce((sum,p)=>sum+p.reserved,0) || 1;
@@ -2983,7 +3126,7 @@ function buildAdvanceReceiptSale(a){
   })) : [{ productName:"Advance payment", unit:"", qtySold:1, unitPrice:a.amountPaid, unitCost:0 }];
   return { receiptNumber:a.receiptNumber, createdAt:a.createdAt, cashierName: state.user?.name||"Store",
     customerName:a.customerName, customerId:a.customerId, items, subtotal:total, discount:0, taxPct:0, tax:0, total,
-    amountPaid:a.amountPaid, balance:a.balance, paymentMethod:"Advance Payment", paymentBreakdown:null,
+    amountPaid:a.amountPaid, balance:a.balance, paymentMethod:"Advance Payment", paymentBreakdown:a.paymentBreakdown||null,
     advanceProducts: a.products||[], advanceCollections: a.collections||[], creditBalance:a.creditBalance||0 };
 }
 window.viewDebtReceipt = function(id){
@@ -3126,7 +3269,7 @@ function drawReturnsPdfSection(pdf, sale, y){
 function enrichSaleWithAdvance(sale){
   const adv = state.advances.find(a=>a.saleId===sale.id);
   if(!adv) return sale;
-  const money_ = adv.pickupOnly ? {} : { amountPaid:adv.amountPaid, balance:adv.balance, creditBalance:adv.creditBalance||0 }; // pick-up records carry no money of their own
+  const money_ = adv.pickupOnly ? {} : { amountPaid:adv.amountPaid, balance:adv.balance, creditBalance:adv.creditBalance||0, paymentBreakdown:adv.paymentBreakdown || sale.paymentBreakdown || null }; // pick-up records carry no money of their own
   return Object.assign({}, sale, money_, { advanceProducts:adv.products||[], advanceCollections:adv.collections||[], collectionStatus:adv.collectionStatus });
 }
 /* Same idea for Credit/Debt sales — a sale paid on credit gets a linked
@@ -3630,6 +3773,7 @@ window.openManualAdvanceModal = function(){
       <div class="field"><label>Phone</label><input id="maPhone"></div>
       <div class="field"><label>Amount Paid</label><input type="number" id="maPaid" min="0"></div>
     </div>
+    ${paidByInlineHTML("ma","needed when an amount is paid")}
     <div class="section-head" style="margin-top:10px"><h3 style="font-size:13.5px">Products Reserved</h3>
       <button class="btn btn-ghost btn-sm" id="maAddRow">+ Add product</button></div>
     <div id="maRows"></div>
@@ -3684,6 +3828,7 @@ window.openManualAdvanceModal = function(){
   };
   addRow();
   document.getElementById("maAddRow").addEventListener("click", addRow);
+  wirePaidByInline("ma", document.getElementById("maPaid"));
   document.getElementById("maSave").onclick = async ()=>{
     const name = document.getElementById("maCust").value.trim();
     if(!name) return toast("Customer name is required","err");
@@ -3694,6 +3839,11 @@ window.openManualAdvanceModal = function(){
       return { productId:p.id, productName:p.name, reserved:+r.querySelector(".maQty").value||0, unit, collected:0, unitPrice:unitPriceFor(p, unit) };
     }).filter(p=>p.reserved>0);
     if(!products.length && !(+document.getElementById("maPaid").value>0)) return toast("Enter the amount paid, or add at least one reserved product","err");
+
+    // How the money was paid — checked first, before stock is reserved or a customer is created, so a rejected save leaves nothing half-done.
+    const paidNow = Math.max(0, +document.getElementById("maPaid").value||0);
+    const paidLines = readPaidByInline("ma", paidNow, "the amount paid");
+    if(paidLines===null) return;
 
     // Reserve the stock for these goods immediately, exactly the way a
     // Sales-screen Advance Payment already does — otherwise the same
@@ -3724,6 +3874,7 @@ window.openManualAdvanceModal = function(){
     const adv = { id:genId("adv"), customerId:customer.id, customerName:customer.name, phone:customer.phone||phoneInput,
       saleId:null, receiptNumber:"ADV-"+Date.now().toString().slice(-8), amountPaid:paid, total:totalVal, balance, creditBalance,
       products, collectionStatus: products.length ? "Not Collected" : "Fully Collected", isDeposit: !products.length,
+      paymentBreakdown: paidLines.map(l=>({ method:l.method, amount:l.amount })),
       createdBy: state.user.name, notes:document.getElementById("maNotes").value.trim(), createdAt:Date.now() };
     for(const p of products){
       const product = advProduct(p);
@@ -3735,6 +3886,11 @@ window.openManualAdvanceModal = function(){
         type:"Advance reserved", change:-deduction, reference:adv.receiptNumber, createdAt:Date.now(), by:state.user.name });
     }
     await dataSet("advancePayments", adv); state.advances.push(adv);
+    // The money received goes into the payments ledger under its real method(s), so the Payment Summary counts it.
+    for(const l of paidLines){
+      await dataSet("payments", { id:genId("pay"), type:"advance", advanceId:adv.id, receiptNumber:adv.receiptNumber,
+        method:l.method, amount:l.amount, createdAt:Date.now(), by:state.user.name, customerId:customer.id });
+    }
     await syncAdvanceDebt(adv);
     closeModal(); toast("Advance payment added — stock reserved for the customer","ok"); drawCreditTab("advances");
   };
@@ -3759,7 +3915,10 @@ window.recordDebtPayment = function(id){
     if(!(amt>0.009)){ toast("Enter a payment amount greater than zero","err"); return; }
     await applyDebtPayment(debt, amt, method);
     await dataSet("payments", { id:genId("pay"), type:"debt", debtId:debt.id, receiptNumber:debt.receiptNumber, method, amount:amt, createdAt:Date.now(), by:state.user.name });
-    closeModal(); toast("Payment recorded","ok"); drawCreditTab("debts");
+    closeModal(); toast("Payment recorded","ok");
+    // This dialog can be opened from Credit & Advance OR from Receipt History — refresh whichever is showing.
+    if(document.getElementById("creditTabBody")) drawCreditTab("debts");
+    else if(state.page==="receipts") renderReceipts();
   };
 };
 // Admin-only: mark an uncollectible debt's remaining balance as a write-off
@@ -3858,6 +4017,7 @@ window.viewAdvance = function(id){
     <p style="font-size:11.5px;color:var(--ink-soft);margin-top:4px">If a customer collects more product value than they've paid for, the shortfall is automatically moved into the Credit & Advance debtors ledger when you hit Save.</p>
     <div class="field" style="margin-top:12px"><label>Additional Payment Now (optional)</label><input type="number" id="advExtraPay" min="0" value="0">
       <p style="font-size:11.5px;color:var(--ink-soft);margin-top:4px">You can pay more than the outstanding balance — any excess is added to Store Credit.</p></div>
+    ${paidByInlineHTML("adv","needed when an additional payment is entered")}
   </div>
   <div class="modal-foot"><button class="btn btn-ghost" onclick="window.__closeModal()">Close</button>
   <button class="btn btn-gold" onclick="viewAdvanceReceipt('${adv.id}')">🧾 Receipt</button>
@@ -3904,7 +4064,13 @@ window.viewAdvance = function(id){
     rowsHost.appendChild(row); wireRow(row); updateGoodsValue();
   });
 
+  wirePaidByInline("adv", document.getElementById("advExtraPay"));
   document.getElementById("advSave").onclick = async ()=>{
+    // How the additional payment was paid — checked before anything is saved: the steps below change stock,
+    // collections and debts, so a rejected payment must not leave any of that half-applied.
+    const extraNow = Math.max(0, +document.getElementById("advExtraPay").value||0);
+    const extraLines = readPaidByInline("adv", extraNow, "the additional payment");
+    if(extraLines===null) return;
     const priorProducts = adv.products; // snapshot for the stock reconciliation below
     const seenIdx = new Set();
     const mappedRows = [...rowsHost.children].map(row=>{
@@ -4044,8 +4210,9 @@ window.viewAdvance = function(id){
       }
     }
 
-    const extra = Math.max(0, +document.getElementById("advExtraPay").value||0);
+    const extra = extraNow;
     if(extra>0){
+      const prevPaid = adv.amountPaid;
       if(adv.balance>0){
         const towardBalance = Math.min(adv.balance, extra);
         adv.balance -= towardBalance;
@@ -4054,6 +4221,7 @@ window.viewAdvance = function(id){
         adv.creditBalance += extra;
       }
       adv.amountPaid += extra;
+      noteAdvanceMoneyIn(adv, prevPaid, extraLines);
     }
     // if total was edited, recompute balance/credit against the new total
     if(adv.total!==null){
@@ -4067,6 +4235,11 @@ window.viewAdvance = function(id){
     const anyCollected = adv.products.some(p=>p.collected>0);
     adv.collectionStatus = allCollected ? "Fully Collected" : anyCollected ? "Partially Collected" : "Not Collected";
     await dataSet("advancePayments", adv);
+    // The additional payment goes into the payments ledger under its real method(s), so the Payment Summary counts it.
+    for(const l of extraLines){
+      await dataSet("payments", { id:genId("pay"), type:"advance", advanceId:adv.id, receiptNumber:adv.receiptNumber,
+        method:l.method, amount:l.amount, createdAt:Date.now(), by:state.user.name, customerId:adv.customerId });
+    }
     const owedBefore = state.debts.find(d=>d.advanceId===adv.id)?.balance || 0;
     await syncAdvanceDebt(adv);
     const owedAfter = state.debts.find(d=>d.advanceId===adv.id)?.balance || 0;
@@ -4292,7 +4465,10 @@ async function acctApplyPayment(key, amount, method, opts={}){
       debt.history.push(entry);
       const adv = state.advances.find(a=>a.id===debt.advanceId);
       if(adv){
+        const prevPaid = adv.amountPaid;
         adv.amountPaid = acctR2(adv.amountPaid + amt);
+        const lines = linesForPayment(method, amt, null);
+        if(lines){ entry.lines = lines; noteAdvanceMoneyIn(adv, prevPaid, lines); }
         await dataSet("advancePayments", adv);
         await syncAdvanceDebt(adv);
       } else {
@@ -5390,6 +5566,7 @@ function refreshViews(){
     else if(pg==="products") renderProducts();
     else if(pg==="inventory") renderInventory();
     else if(pg==="dashboard") goPage("dashboard");
+    else if(pg==="paysum") renderPaymentSummary();
   }catch(e){ console.warn("refreshViews", e); }
 }
 const outstandingGoods = adv => (adv.products||[]).reduce((a,p)=>a+Math.max(0,(p.reserved||0)-(p.collected||0)),0);
@@ -6061,6 +6238,199 @@ function runReport(){
   if(!rows.length){ out.innerHTML = `<div class="empty-state"><div class="ic">📈</div>No data for this range</div>`; return; }
   out.innerHTML = `<div class="table-wrap" style="margin-top:14px"><table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join("")}</tr></thead>
     <tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${typeof r[c]==="number"?money(r[c]).replace(/^\D+/,'').length&&["Total","Amount","Balance","Profit","Revenue","Cost","Total Spent","Value","Total Sales","Paid","Store Credit"].includes(c)?money(r[c]):r[c]:escapeHtml(String(r[c]??""))}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+
+/* ------------------------------------------------------------------
+   26b. PAYMENT SUMMARY  (Admin only)
+   How much money was received as Cash, POS and Transfer — for any single
+   day, or for every day. Built ONLY from the Payments ledger, which holds
+   one row per payment method actually received (a "Transfer + Cash" sale
+   has one Transfer row and one Cash row), so each part lands under its own
+   method and nothing is counted twice.
+     counted as money received : sale, split, debt (repayment), advance (deposit)
+     NOT counted               : storeCredit (internal), supplierPayment (money out)
+     shown separately          : refund (cash handed back to a customer)
+   All sums are done in whole kobo (integers) so there is no floating-point drift.
+------------------------------------------------------------------ */
+const PAYSUM_RECEIVED_TYPES = ["sale","split","debt","advance"];
+const PAYSUM_BUCKETS = ["Cash","POS","Transfer","Other"];
+const PAYSUM_ICONS = { Cash:"💵", POS:"💳", Transfer:"🏦", Other:"🧩" };
+const PAYSUM_TYPE_LABEL = { sale:"Sale", split:"Sale (split payment)", debt:"Debt repayment", advance:"Advance deposit" };
+
+function paysumBucket(method){
+  const m = String(method||"").trim().toLowerCase();
+  if(m==="cash") return "Cash";
+  if(m==="pos") return "POS";
+  if(m==="transfer" || m==="bank transfer") return "Transfer";
+  return "Other";   // Bank, Mobile Money, Cheque, Wallet, or a Credit/Advance "paid now" with no method chosen
+}
+function paysumEntries(){
+  const saleBy = new Map((state.sales||[]).map(s=>[s.id,s]));
+  const debtBy = new Map((state.debts||[]).map(d=>[d.id,d]));
+  const advBy  = new Map((state.advances||[]).map(a=>[a.id,a]));
+  const custBy = new Map((state.customers||[]).map(c=>[c.id,c]));
+  const received = [], refunds = [];
+  for(const p of (state.payments||[])){
+    const cents = Math.round((Number(p.amount)||0)*100);
+    const ts = Number(p.createdAt)||0;
+    if(!(cents>0) || !ts) continue;
+    const isReceived = PAYSUM_RECEIVED_TYPES.includes(p.type);
+    if(!isReceived && p.type!=="refund") continue;
+    let customer = "";
+    if(p.saleId){ const s=saleBy.get(p.saleId); customer = s ? (s.customerName||"Walk-in") : ""; }
+    else if(p.debtId){ const d=debtBy.get(p.debtId); customer = d ? d.customerName : ""; }
+    else if(p.advanceId){ const a=advBy.get(p.advanceId); customer = a ? a.customerName : ""; }
+    if(!customer && p.customerId){ const c=custBy.get(p.customerId); customer = c ? c.name : ""; }
+    const e = { id:p.id, ts, day:localDateStr(new Date(ts)), type:p.type, receipt:p.receiptNumber||"", customer:customer||"",
+      method:p.method||"", bucket: isReceived ? paysumBucket(p.method) : "Cash", cents, by:p.by||"" };
+    (isReceived ? received : refunds).push(e);
+  }
+  return { received, refunds };
+}
+// day -> { Cash, POS, Transfer, Other, total, refunds, count } (all in kobo)
+function paysumByDay(entries){
+  const days = new Map();
+  const get = day=>{ let d=days.get(day); if(!d){ d={ Cash:0, POS:0, Transfer:0, Other:0, total:0, refunds:0, count:0 }; days.set(day,d); } return d; };
+  entries.received.forEach(e=>{ const d=get(e.day); d[e.bucket]+=e.cents; d.total+=e.cents; d.count++; });
+  entries.refunds.forEach(e=>{ get(e.day).refunds+=e.cents; });
+  return days;
+}
+const paysumMoney = c => money(c/100);
+function paysumShiftDay(day, delta){
+  const [y,m,d] = day.split("-").map(Number);
+  return localDateStr(new Date(y, m-1, d+delta));
+}
+function paysumDayLabel(day){
+  const [y,m,d] = day.split("-").map(Number);
+  return new Date(y,m-1,d).toLocaleDateString("en-NG",{ weekday:"long", day:"numeric", month:"long", year:"numeric" });
+}
+function paysumStatCards(tot, grand){
+  const cards = [
+    { lbl:"Cash Received",     val:tot.Cash,     ic:PAYSUM_ICONS.Cash,     bg:"var(--ok-light)",    fg:"var(--ok)" },
+    { lbl:"POS Received",      val:tot.POS,      ic:PAYSUM_ICONS.POS,      bg:"var(--info-light)",  fg:"var(--info)" },
+    { lbl:"Transfer Received", val:tot.Transfer, ic:PAYSUM_ICONS.Transfer, bg:"var(--gold-light)",  fg:"var(--warn)" },
+    { lbl:"Total Received",    val:grand,        ic:"💰",                  bg:"var(--brand-light)", fg:"var(--brand-dark)" }
+  ];
+  return `<div class="grid grid-4">${cards.map(c=>`<div class="card stat-card"><div class="top"><div class="ic" style="background:${c.bg};color:${c.fg}">${c.ic}</div></div>
+    <div class="val">${paysumMoney(c.val)}</div><div class="lbl">${c.lbl}</div></div>`).join("")}</div>`;
+}
+function paysumInfoStrip(other, refunds, cash){
+  const bits = [];
+  if(other>0) bits.push(`🧩 <b>${paysumMoney(other)}</b> received by other methods (Bank, Mobile Money, Cheque, Wallet, or an older credit/advance payment recorded before a "Paid by" method was asked) — included in the total`);
+  if(refunds>0) bits.push(`↩️ <b>${paysumMoney(refunds)}</b> cash refunded to customers · Net cash after refunds: <b>${paysumMoney(cash-refunds)}</b>`);
+  return bits.length ? `<div class="card" style="margin-top:14px;font-size:13px;line-height:1.7">${bits.join("<br>")}</div>` : "";
+}
+function paysumMethodTable(bucket, rows){
+  const showMethod = bucket==="Other";
+  const sum = rows.reduce((a,e)=>a+e.cents,0);
+  const time = ts=> new Date(ts).toLocaleTimeString("en-NG",{ hour:"2-digit", minute:"2-digit" });
+  const body = rows.length ? rows.map(e=>`<tr><td>${time(e.ts)}</td><td class="mono">${escapeHtml(e.receipt||"—")}</td>
+      <td>${escapeHtml(e.customer||"—")}</td><td>${escapeHtml(PAYSUM_TYPE_LABEL[e.type]||e.type)}</td>
+      ${showMethod?`<td>${escapeHtml(e.method||"—")}</td>`:""}<td>${escapeHtml(e.by||"—")}</td><td style="text-align:right;font-weight:600">${paysumMoney(e.cents)}</td></tr>`).join("")
+    : `<tr><td colspan="${showMethod?7:6}"><div class="empty-state" style="padding:18px">No ${bucket==="Other"?"other-method":bucket} payments on this day</div></td></tr>`;
+  return `<div class="card" style="margin-top:14px">
+    <div class="section-head"><h3>${PAYSUM_ICONS[bucket]} ${bucket==="Other"?"Other methods":bucket}</h3>
+      <span class="pill pill-info">${rows.length} payment${rows.length===1?"":"s"} · ${paysumMoney(sum)}</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Time</th><th>Receipt</th><th>Customer</th><th>Type</th>${showMethod?"<th>Method</th>":""}<th>Received by</th><th style="text-align:right">Amount</th></tr></thead>
+    <tbody>${body}</tbody>
+    ${rows.length?`<tfoot><tr><td colspan="${showMethod?6:5}" style="font-weight:700">Total ${bucket==="Other"?"other":bucket}</td><td style="text-align:right;font-weight:700">${paysumMoney(sum)}</td></tr></tfoot>`:""}
+    </table></div></div>`;
+}
+function paysumRefundTable(rows){
+  const sum = rows.reduce((a,e)=>a+e.cents,0);
+  const time = ts=> new Date(ts).toLocaleTimeString("en-NG",{ hour:"2-digit", minute:"2-digit" });
+  return `<div class="card" style="margin-top:14px">
+    <div class="section-head"><h3>↩️ Cash refunds paid out</h3><span class="pill pill-danger">${rows.length} · ${paysumMoney(sum)}</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Time</th><th>Receipt</th><th>Customer</th><th>Refunded by</th><th style="text-align:right">Amount</th></tr></thead>
+    <tbody>${rows.map(e=>`<tr><td>${time(e.ts)}</td><td class="mono">${escapeHtml(e.receipt||"—")}</td><td>${escapeHtml(e.customer||"—")}</td>
+      <td>${escapeHtml(e.by||"—")}</td><td style="text-align:right;font-weight:600">${paysumMoney(e.cents)}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
+
+function paysumDraw(){
+  const ps = window.__paysum, host = document.getElementById("paysumBody");
+  if(!host) return;
+  const entries = paysumEntries();
+  const days = paysumByDay(entries);
+  const csv = [];
+  document.querySelectorAll("#paysumModeDay,#paysumModeAll").forEach(b=> b.classList.toggle("btn-primary", b.dataset.mode===ps.mode));
+  document.querySelectorAll("#paysumModeDay,#paysumModeAll").forEach(b=> b.classList.toggle("btn-ghost", b.dataset.mode!==ps.mode));
+  document.getElementById("paysumDayCtl").style.display = ps.mode==="day" ? "flex" : "none";
+  document.getElementById("paysumDay").value = ps.day;
+
+  if(ps.mode==="day"){
+    const rec = entries.received.filter(e=>e.day===ps.day).sort((a,b)=>a.ts-b.ts);
+    const ref = entries.refunds.filter(e=>e.day===ps.day).sort((a,b)=>a.ts-b.ts);
+    const d = days.get(ps.day) || { Cash:0, POS:0, Transfer:0, Other:0, total:0, refunds:0, count:0 };
+    let html = `<h3 style="margin:2px 0 12px;font-size:15px">${escapeHtml(paysumDayLabel(ps.day))}</h3>` + paysumStatCards(d, d.total) + paysumInfoStrip(d.Other, d.refunds, d.Cash);
+    PAYSUM_BUCKETS.forEach(b=>{
+      const rows = rec.filter(e=>e.bucket===b);
+      if(b==="Other" && !rows.length) return;
+      html += paysumMethodTable(b, rows);
+    });
+    if(ref.length) html += paysumRefundTable(ref);
+    if(!rec.length && !ref.length) html += `<div class="empty-state" style="margin-top:14px"><div class="ic">💰</div>No payments were recorded on this day</div>`;
+    host.innerHTML = html;
+    rec.forEach(e=> csv.push({ Date:ps.day, Time:new Date(e.ts).toLocaleTimeString("en-NG",{hour:"2-digit",minute:"2-digit"}), Section:e.bucket, Method:e.method||"", Receipt:e.receipt, Customer:e.customer, Type:PAYSUM_TYPE_LABEL[e.type]||e.type, "Received By":e.by, Amount:(e.cents/100).toFixed(2) }));
+    ref.forEach(e=> csv.push({ Date:ps.day, Time:new Date(e.ts).toLocaleTimeString("en-NG",{hour:"2-digit",minute:"2-digit"}), Section:"Cash refund (paid out)", Method:"Cash", Receipt:e.receipt, Customer:e.customer, Type:"Refund", "Received By":e.by, Amount:"-"+(e.cents/100).toFixed(2) }));
+    window.__paysumCsv = { rows:csv, name:`payments-${ps.day}.csv` };
+  } else {
+    const list = [...days.entries()].sort((a,b)=> a[0]<b[0]?1:-1);
+    const all = { Cash:0, POS:0, Transfer:0, Other:0, total:0, refunds:0, count:0 };
+    list.forEach(([,d])=>{ for(const k in all) all[k]+=d[k]; });
+    let html = `<h3 style="margin:2px 0 12px;font-size:15px">All days — ${list.length} day${list.length===1?"":"s"} with payments</h3>` + paysumStatCards(all, all.total) + paysumInfoStrip(all.Other, all.refunds, all.Cash);
+    if(list.length){
+      html += `<div class="card" style="margin-top:14px"><div class="section-head"><h3>Daily breakdown</h3><span style="font-size:12px;color:var(--ink-soft)">Tap a day to see every payment in it</span></div>
+        <div class="table-wrap"><table><thead><tr><th>Date</th><th style="text-align:right">💵 Cash</th><th style="text-align:right">💳 POS</th><th style="text-align:right">🏦 Transfer</th><th style="text-align:right">🧩 Other</th><th style="text-align:right">Total Received</th><th style="text-align:right">Cash Refunds</th><th style="text-align:right">Payments</th></tr></thead>
+        <tbody>${list.map(([day,d])=>`<tr class="paysum-row" data-day="${day}" style="cursor:pointer"><td><b>${escapeHtml(new Date(...day.split("-").map((n,i)=>i===1?n-1:+n)).toLocaleDateString("en-NG",{weekday:"short",day:"2-digit",month:"short",year:"numeric"}))}</b></td>
+          <td style="text-align:right">${paysumMoney(d.Cash)}</td><td style="text-align:right">${paysumMoney(d.POS)}</td><td style="text-align:right">${paysumMoney(d.Transfer)}</td>
+          <td style="text-align:right">${paysumMoney(d.Other)}</td><td style="text-align:right;font-weight:700">${paysumMoney(d.total)}</td>
+          <td style="text-align:right">${d.refunds?paysumMoney(d.refunds):"—"}</td><td style="text-align:right">${d.count}</td></tr>`).join("")}</tbody>
+        <tfoot><tr><td style="font-weight:700">TOTAL</td><td style="text-align:right;font-weight:700">${paysumMoney(all.Cash)}</td><td style="text-align:right;font-weight:700">${paysumMoney(all.POS)}</td>
+          <td style="text-align:right;font-weight:700">${paysumMoney(all.Transfer)}</td><td style="text-align:right;font-weight:700">${paysumMoney(all.Other)}</td>
+          <td style="text-align:right;font-weight:700">${paysumMoney(all.total)}</td><td style="text-align:right;font-weight:700">${all.refunds?paysumMoney(all.refunds):"—"}</td><td style="text-align:right;font-weight:700">${all.count}</td></tr></tfoot></table></div></div>`;
+    } else html += `<div class="empty-state" style="margin-top:14px"><div class="ic">💰</div>No payments recorded yet</div>`;
+    host.innerHTML = html;
+    host.querySelectorAll(".paysum-row").forEach(tr=> tr.addEventListener("click", ()=>{ ps.mode="day"; ps.day=tr.dataset.day; paysumDraw(); }));
+    list.slice().reverse().forEach(([day,d])=> csv.push({ Date:day, Cash:(d.Cash/100).toFixed(2), POS:(d.POS/100).toFixed(2), Transfer:(d.Transfer/100).toFixed(2),
+      Other:(d.Other/100).toFixed(2), "Total Received":(d.total/100).toFixed(2), "Cash Refunds":(d.refunds/100).toFixed(2), Payments:d.count }));
+    if(list.length) csv.push({ Date:"TOTAL", Cash:(all.Cash/100).toFixed(2), POS:(all.POS/100).toFixed(2), Transfer:(all.Transfer/100).toFixed(2),
+      Other:(all.Other/100).toFixed(2), "Total Received":(all.total/100).toFixed(2), "Cash Refunds":(all.refunds/100).toFixed(2), Payments:all.count });
+    window.__paysumCsv = { rows:csv, name:"payments-all-days.csv" };
+  }
+}
+function renderPaymentSummary(resetToToday){
+  if(!state.user || state.user.role!=="admin"){ toast("Only an admin can view the Payment Summary.","err"); return; }
+  if(!window.__paysum || resetToToday) window.__paysum = { mode:"day", day:localDateStr() };
+  const ps = window.__paysum;
+  setContent(`<div class="card">
+    <div class="section-head"><div><h3>Payment Summary</h3><p>Cash, POS and Transfer received — a payment split across methods is divided under each one</p></div>
+      <div class="toolbar">
+        <button class="btn btn-sm btn-primary" id="paysumModeDay" data-mode="day">Selected day</button>
+        <button class="btn btn-sm btn-ghost" id="paysumModeAll" data-mode="all">All days</button>
+        <span id="paysumDayCtl" style="display:flex;gap:6px;align-items:center">
+          <button class="btn btn-ghost btn-sm" id="paysumPrev" title="Previous day">◀</button>
+          <input type="date" id="paysumDay" value="${ps.day}">
+          <button class="btn btn-ghost btn-sm" id="paysumNext" title="Next day">▶</button>
+          <button class="btn btn-ghost btn-sm" id="paysumToday">Today</button>
+        </span>
+        <button class="btn btn-gold btn-sm" id="paysumCsv">Export CSV</button>
+        <button class="btn btn-ghost btn-sm" id="paysumPrint">🖨️ Print</button>
+      </div></div>
+    <div id="paysumBody"></div></div>`);
+  const $ = id=>document.getElementById(id);
+  $("paysumModeDay").onclick = ()=>{ ps.mode="day"; paysumDraw(); };
+  $("paysumModeAll").onclick = ()=>{ ps.mode="all"; paysumDraw(); };
+  $("paysumPrev").onclick  = ()=>{ ps.day = paysumShiftDay(ps.day,-1); paysumDraw(); };
+  $("paysumNext").onclick  = ()=>{ ps.day = paysumShiftDay(ps.day, 1); paysumDraw(); };
+  $("paysumToday").onclick = ()=>{ ps.day = localDateStr(); paysumDraw(); };
+  $("paysumDay").addEventListener("change", e=>{ if(e.target.value){ ps.day = e.target.value; paysumDraw(); } });
+  $("paysumCsv").onclick = ()=>{ const c = window.__paysumCsv; if(c) exportCSV(c.rows, c.name); };
+  $("paysumPrint").onclick = ()=>{
+    const area = $("printArea");
+    area.innerHTML = `<div style="padding:20px"><h2 style="margin:0 0 4px">${escapeHtml(state.settings.name||STORE.name)} — Payment Summary</h2>${$("paysumBody").innerHTML}</div>`;
+    area.style.display="block"; setTimeout(()=>{ window.print(); area.style.display="none"; },200);
+  };
+  paysumDraw();
 }
 
 /* ------------------------------------------------------------------
